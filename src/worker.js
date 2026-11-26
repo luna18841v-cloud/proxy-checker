@@ -32,17 +32,14 @@ const MM_ONE = ip => 'https://www.maxmind.com/en/geoip-web-services-demo/' + enc
 const ALLOW = /^https:\/\/(?:www\.)?(?:maxmind\.com|scamalytics\.com|ip2location\.com)\//
 const IPAPI_IS = (ip, key) => `https://api.ipapi.is/?q=${encodeURIComponent(ip)}&key=${encodeURIComponent(key)}`
 
-// MaxMind-এর জন্য আলাদা আলাদা egress — কোটা ছড়িয়ে যায়
+// প্রতিটা রিলে আলাদা egress — সবগুলো একসাথে চালানো হয়
 const MM_RELAYS = [
   u => 'https://r.jina.ai/' + u,
   u => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
   u => 'https://api.codetabs.com/v1/proxy/?quest=' + encodeURIComponent(u),
   u => 'https://corsproxy.io/?url=' + encodeURIComponent(u),
-  u => 'https://api.cors.lol/?url=' + encodeURIComponent(u),
-  u => 'https://test.cors.workers.dev/?' + u,
-  u => 'https://cors.isomorphic-git.org/' + u
+  u => 'https://api.cors.lol/?url=' + encodeURIComponent(u)
 ]
-let RRI = 0
 
 const ECHO_HTTP = ['http://api.ipify.org/?format=json', 'http://checkip.amazonaws.com/',
   'http://icanhazip.com/', 'http://ip-api.com/json/?fields=query', 'http://ifconfig.me/ip']
@@ -67,6 +64,10 @@ const inflight = new Map()
 const CT_RE = /"connection_type"\s*:\s*"([^"]+)"/i
 const CT_ANY = /(Cable\/DSL|Cellular|Corporate|Satellite)/i
 const CT_HIT = /connection_type|Connection Type/i
+const LIMIT_RE = /reached[^.]{0,40}limit|too many requests|25 IP addresses/i
+
+const CELL_RE = /(mobile|cellular|wireless|\bgsm\b|\blte\b|\b5g\b|\b4g\b|umts|cdma|telecom|telenor|vodafone|telefonica|airtel|\bjio\b|claro|\btim\b|\bvivo\b|\bmtn\b|zain|etisalat|cellcom|proximus|\bkpn\b|swisscom|telstra|optus|singtel|turkcell|telia|elisa|safaricom|mobifone|telkomsel|indosat|beeline|megafon|\bmts\b|kcell|azercell|\bo2\b|orange)/i
+const DC_RE = /(hosting|datacenter|data center|\bvps\b|cloud|server|colo|amazon|aws|google|azure|microsoft|digitalocean|linode|ovh|hetzner|contabo|vultr|oracle|alibaba|tencent|leaseweb|m247|choopa|cogent|scaleway)/i
 
 const FIELDS = ['proxy', 'scheme', 'ip', 'verdict', 'reasons', 'src', 'sl_src', 'i2l_src', 'ct_src',
                 'sl_vpn', 'sl_rproxy', 'sl_dc', 'i2l_anon', 'i2l_fraud', 'i2l_seen', 'api_flags',
@@ -371,6 +372,8 @@ const TAG = /<[^>]+>/g
 const stripTags = s => String(s || '').replace(TAG, ' ')
   .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#39;/g, "'")
   .replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+const deEnt = s => String(s || '').replace(/&quot;/g, '"').replace(/&#34;/g, '"')
+  .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/<[^>]+>/g, ' ')
 
 function cellOf(html, label, wrap) {
   const open = wrap === 'th' ? '<th>' + label + '</th>' : '<strong>' + label + '</strong>'
@@ -440,19 +443,6 @@ function parseI2l(t) {
 
 const yn = v => ({ YES: 'YES', TRUE: 'YES', NO: 'NO', FALSE: 'NO', 'N/A': 'N/A' }[String(v || '').trim().toUpperCase()] || '')
 
-function parseWSl(j) {
-  if (!j) return null
-  const o = { vpn: yn(j.vpn), rproxy: yn(j.rproxy), dc: yn(j.dc) }
-  return (o.vpn || o.dc || o.rproxy) ? o : null
-}
-
-function parseWI2l(j) {
-  if (!j) return null
-  const o = { anon: yn(j.anon), seen: String(j.seen || '').trim().slice(0, 40),
-              fraud: String(j.fraud || '').replace(/\D/g, '').slice(0, 3) }
-  return (o.anon || o.fraud || o.seen) ? o : null
-}
-
 function seenDays(v) {
   const m = String(v || '').match(new RegExp(String.raw`(\d+)\s*(second|minute|hour|day|week|month|year)s?\s*ago`, 'i'))
   if (!m) return null
@@ -481,7 +471,7 @@ function i2lVerdict(p) {
   return ['PASS', `anon=No fraud=${fv} seen='${seen || '-'}'`]
 }
 
-// ---------- MaxMind (একমাত্র CT সোর্স) ----------
+// ---------- MaxMind ----------
 function normCt(v) {
   const s = String(v || '').trim().toLowerCase()
   if (s.includes('cable') || s.includes('dsl')) return 'Cable/DSL'
@@ -513,10 +503,78 @@ function rowCells(t, ip) {
   return cells
 }
 
+// পেজের ভেতরের JSON ব্লক (<pre> … "connection_type" …)
+function mmPreJson(t, ip) {
+  const i = t.indexOf('"connection_type"')
+  if (i === -1) return null
+  const ps = t.lastIndexOf('<pre', i)
+  const pe = t.indexOf('</pre>', i)
+  if (ps === -1 || pe === -1) return null
+  const raw = deEnt(t.slice(ps, pe))
+  const o = { ct: '', asn: '', asnorg: '', isp: '', org: '', lat: '', lon: '', net: '' }
+  const ct = raw.match(CT_RE)
+  if (!ct) return null
+  o.ct = normCt(ct[1])
+  const tip = raw.indexOf('"traits"')
+  if (tip !== -1) {
+    const seg = raw.slice(tip, tip + 1600)
+    const a = jn(seg, 'autonomous_system_number')
+    o.asn = a ? 'AS' + a : ''
+    o.asnorg = js(seg, 'autonomous_system_organization')
+    o.isp = js(seg, 'isp'); o.org = js(seg, 'organization'); o.net = js(seg, 'network')
+    const li = raw.indexOf('"location"')
+    if (li !== -1) { const ls = raw.slice(li, li + 400); o.lat = jn(ls, 'latitude'); o.lon = jn(ls, 'longitude') }
+  }
+  return o
+}
+
+// রিলে-টেক্সট: "Label: value" / "Label | value" লাইন
+const MM_LABELS = [
+  ['connection type', 'ct'],
+  ['isp / organization', 'isp'],
+  ['as organization', 'asnorg'],
+  ['isp', 'isp'],
+  ['organization', 'org'],
+  ['network', 'net'],
+  ['domain', 'net'],
+  ['postal code', 'net'],
+  ['approximate latitude / longitude', 'geo'],
+  ['coordinates', 'geo'],
+  ['accuracy radius', 'net'],
+  ['timezone', 'net']
+]
+const mmNormLbl = s => stripTags(s || '').replace(/\*/g, ' ').replace(/\(desc\??\)/gi, ' ')
+  .replace(/\s+/g, ' ').trim().toLowerCase()
+
+function mmPlain(t) {
+  const o = { ct: '', asn: '', asnorg: '', isp: '', org: '', lat: '', lon: '', net: '' }
+  const lines = String(t || '').split(/\r?\n/)
+  for (let ln of lines) {
+    ln = ln.replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
+      .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
+      .replace(/\*\*/g, '').replace(/^[\s>*\-\u2022|]+/, '').replace(/\s+/g, ' ').trim()
+    if (!ln) continue
+    const low = mmNormLbl(ln)
+    for (const [lab, key] of MM_LABELS) {
+      if (!low.startsWith(lab)) continue
+      let rest = ln.slice(lab.length).replace(/^[\s:|\-\u2013\u2014]+/, '').trim()
+      if (!rest || rest === '-') break
+      if (key === 'ct') { const c = normCt(rest); if (c && !o.ct) o.ct = c }
+      else if (key === 'geo') {
+        if (!o.lat) { const g = rest.match(/(-?\d+\.\d+)\s*,?\s*(-?\d+\.\d+)/); if (g) { o.lat = g[1]; o.lon = g[2] } }
+      } else if (!o[key]) o[key] = rest.slice(0, 60)
+      break
+    }
+  }
+  return (o.ct || o.isp) ? o : null
+}
+
 function parseMm(t, ip) {
   if (!t || !t.includes(ip)) return null
-  const o = { ct: '', asn: '', asnorg: '', isp: '', org: '', lat: '', lon: '', net: '' }
+  const pre = mmPreJson(t, ip)
+  if (pre && pre.ct) return pre
 
+  const o = { ct: '', asn: '', asnorg: '', isp: '', org: '', lat: '', lon: '', net: '' }
   const ci = t.indexOf('"connection_type"')
   if (ci !== -1) { const m = t.slice(ci, ci + 80).match(CT_RE); if (m) o.ct = normCt(m[1]) }
 
@@ -553,6 +611,14 @@ function parseMm(t, ip) {
     if (k !== -1) { const m = stripTags(t.slice(k, k + 160)).match(CT_ANY); if (m) o.ct = normCt(m[1]) }
   }
 
+  if (!o.ct) {
+    const pl = mmPlain(t)
+    if (pl) {
+      o.ct = pl.ct || ''
+      for (const k of ['asn', 'asnorg', 'isp', 'org', 'lat', 'lon', 'net']) o[k] = o[k] || pl[k]
+    }
+  }
+
   return (o.ct || o.asn || o.isp) ? o : null
 }
 
@@ -569,22 +635,24 @@ function cdnWrite(ip, v) {
   } catch {}
 }
 
-// রিলে রোটেশন + ডাইরেক্ট
-async function fetchMm(url, ip) {
-  const order = []
-  for (let k = 0; k < 2; k++) order.push(MM_RELAYS[(RRI + k) % MM_RELAYS.length])
-  RRI = (RRI + 2) % MM_RELAYS.length
+// সব রিলে + ডাইরেক্ট একসাথে, প্রথম যেটা CT দেয় সেটাই
+let MM_LIMIT_AT = 0
 
-  for (const f of order) {
-    const t = await requestText(f(url), { timeout: 8000, minLen: 400, needIp: ip })
-    if (t && CT_HIT.test(t)) return t
+async function fetchMm(url, ip) {
+  const jobs = []
+  for (const f of MM_RELAYS) jobs.push(requestText(f(url), { timeout: 9000, minLen: 400, needIp: ip }))
+  jobs.push(requestText(url, { timeout: 7000, minLen: 800, needIp: ip, headers: MM_HDR() }))
+
+  const texts = await Promise.all(jobs)
+  let best = null
+  for (const t of texts) {
+    if (!t) continue
+    if (LIMIT_RE.test(t)) MM_LIMIT_AT = Date.now()
+    const v = parseMm(t, ip)
+    if (v && v.ct) return t
+    if (!best && v) best = t
   }
-  for (let i = 0; i < 2; i++) {
-    const t = await requestText(url, { timeout: 6000, minLen: 800, needIp: ip, headers: MM_HDR() })
-    if (t && CT_HIT.test(t) && !t.slice(0, 3000).toLowerCase().includes('just a moment')) return t
-    await sleep(150 * (i + 1))
-  }
-  return null
+  return best
 }
 
 let BATCH = []
@@ -635,7 +703,7 @@ async function mmInfo(ip) {
   try { return await pr } finally { inflight.delete('mm:' + ip) }
 }
 
-// ---------- ip-api.com — শুধু ভের্ডিক্ট ফ্ল্যাগের জন্য ----------
+// ---------- ip-api.com — শুধু ফ্ল্যাগ ----------
 let APIB = []
 let APIT = null
 let APILAST = 0
@@ -703,7 +771,6 @@ async function apiInfo(ip) {
   try { return await pr } finally { inflight.delete('ia:' + ip) }
 }
 
-// ---------- ঐচ্ছিক: ipapi.is (শুধু ফ্ল্যাগ) ----------
 async function ipapiIs(ip, key) {
   const c = memGet('ii:' + ip, CT_TTL)
   if (c !== undefined) return c
@@ -723,7 +790,16 @@ async function ipapiIs(ip, key) {
   return v
 }
 
-// ---------- টাইপ নির্ণয় (শুধু MaxMind) ----------
+// ---------- টাইপ নির্ণয় ----------
+function deriveCt(org, dcFlag, mobileFlag) {
+  if (dcFlag) return 'Data Center'
+  if (mobileFlag) return 'Cellular'
+  if (!org) return ''
+  if (CELL_RE.test(org)) return 'Cellular'
+  if (DC_RE.test(org)) return 'Data Center'
+  return ''
+}
+
 async function connType(ip, key) {
   const cached = memGet('ct:' + ip, CT_TTL)
   if (cached) return cached
@@ -755,6 +831,11 @@ async function connType(ip, key) {
                 is_vpn: false, is_tor: false, is_abuser: false }
     }
     if (a) r.api = { ...(r.api || {}), ...a }
+
+    if (!r.ct) {
+      const d = deriveCt(r.asnorg || r.org || r.isp, r.api && r.api.is_datacenter, r.api && r.api.is_mobile)
+      if (d) { r.ct = d; r.src = 'derived' }
+    }
 
     memSet('ct:' + ip, r)
     return r
@@ -1015,7 +1096,8 @@ export default {
       const sp = new URL(request.url).searchParams
       if (sp.has('probe')) return probe(request)
       const node = typeof process !== 'undefined' ? process.version : 'n/a'
-      return json(sp.has('health') ? { ok: true, node, ct: 'maxmind-only(relay-rotated)', rt: 'sockets' } : { ok: true })
+      return json(sp.has('health') ? { ok: true, node, ct: 'maxmind(parallel-relay)', rt: 'sockets',
+        limit: MM_LIMIT_AT ? Math.round((Date.now() - MM_LIMIT_AT) / 1000) + 's ago' : 'none' } : { ok: true })
     }
     if (pathname === '/api/page') return pageProxy(request)
     if (pathname === '/api/probe') return probe(request)
