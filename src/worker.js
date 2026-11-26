@@ -20,7 +20,7 @@ const MM_HDR = () => ({ ...HTML_HDR(), 'Referer': 'https://www.maxmind.com/en/ge
 
 const SL_PAGE = ip => 'https://scamalytics.com/ip/' + encodeURIComponent(ip)
 const I2L_PAGE = ip => 'https://www.ip2location.com/demo/' + encodeURIComponent(ip)
-// MaxMind — একমাত্র কানেকশন-টাইপ সোর্স, তাই দুটো ভ্যারিয়েন্ট
+// MaxMind — একমাত্র কানেকশন-টাইপ সোর্স, তাই একাধিক ভ্যারিয়েন্ট
 const MM_URLS = ip => [
   'https://www.maxmind.com/en/geoip-web-services-demo/' + encodeURIComponent(ip),
   'https://www.maxmind.com/en/geoip-web-services-demo?ip_address=' + encodeURIComponent(ip),
@@ -50,7 +50,6 @@ function memSet(k, v) { if (MEM.size > 6000) MEM.clear(); MEM.set(k, { t: Date.n
 const inflight = new Map()
 
 const CT_RE = /"connection_type"\s*:\s*"([^"]+)"/i
-const CT_ROW = /^(Cable\/DSL|Cellular|Corporate|Satellite)$/i
 const CT_ANY = /(Cable\/DSL|Cellular|Corporate|Satellite)/i
 
 const FIELDS = ['proxy', 'scheme', 'ip', 'verdict', 'reasons', 'src', 'sl_src', 'i2l_src', 'ct_src',
