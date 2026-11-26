@@ -5,6 +5,8 @@ const FRAUD_MAX = 20
 const SEEN_OK = new Set(['', '-', '0'])
 const ECHO_MIN = 4000
 const CAP = 900_000
+const BATCH_MAX = 25
+const BATCH_WAIT = 1200
 
 const UAS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -20,12 +22,9 @@ const MM_HDR = () => ({ ...HTML_HDR(), 'Referer': 'https://www.maxmind.com/en/ge
 
 const SL_PAGE = ip => 'https://scamalytics.com/ip/' + encodeURIComponent(ip)
 const I2L_PAGE = ip => 'https://www.ip2location.com/demo/' + encodeURIComponent(ip)
-// MaxMind — একমাত্র কানেকশন-টাইপ সোর্স, তাই একাধিক ভ্যারিয়েন্ট
-const MM_URLS = ip => [
-  'https://www.maxmind.com/en/geoip-web-services-demo/' + encodeURIComponent(ip),
-  'https://www.maxmind.com/en/geoip-web-services-demo?ip_address=' + encodeURIComponent(ip),
-  'https://maxmind.com/en/geoip-web-services-demo/' + encodeURIComponent(ip)
-]
+const MM_BULK = ips => 'https://www.maxmind.com/en/geoip-web-services-demo?ip_address=' +
+  ips.map(encodeURIComponent).join(',')
+const MM_ONE = ip => 'https://www.maxmind.com/en/geoip-web-services-demo/' + encodeURIComponent(ip)
 const ALLOW = /^https:\/\/(?:www\.)?(?:maxmind\.com|scamalytics\.com|ip2location\.com)\//
 const IPAPI_IS = (ip, key) => `https://api.ipapi.is/?q=${encodeURIComponent(ip)}&key=${encodeURIComponent(key)}`
 
@@ -41,12 +40,12 @@ const relays = u => ['https://r.jina.ai/' + u,
 
 // ক্যাশ
 const SL_TTL = 30 * 60 * 1000
-const CT_TTL = 12 * 3600 * 1000
-const CTX_TTL = 10 * 60 * 1000
+const CT_TTL = 7 * 24 * 3600 * 1000
+const CTX_TTL = 3 * 60 * 1000
 const RES_TTL = 15 * 60 * 1000
 const MEM = new Map()
 function memGet(k, ttl) { const h = MEM.get(k); return h && Date.now() - h.t < ttl ? h.v : undefined }
-function memSet(k, v) { if (MEM.size > 6000) MEM.clear(); MEM.set(k, { t: Date.now(), v }) }
+function memSet(k, v) { if (MEM.size > 8000) MEM.clear(); MEM.set(k, { t: Date.now(), v }) }
 const inflight = new Map()
 
 const CT_RE = /"connection_type"\s*:\s*"([^"]+)"/i
@@ -350,51 +349,80 @@ async function requestText(url, opts = {}) {
   return text
 }
 
-// ---------- HTML → মান (শুধু দরকারি উইন্ডো — CPU বাঁচে) ----------
+// ---------- HTML → মান ----------
 const TAG = /<[^>]+>/g
 const stripTags = s => String(s || '').replace(TAG, ' ')
   .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#39;/g, "'")
   .replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
 
+// লেবেল → ঠিক পরের <td> সেল (কমেন্ট/সাবটাইটেল এড়াতে ট্যাগ-ফর্ম ধরে)
+function cellOf(html, label, wrap) {
+  const open = wrap === 'th' ? '<th>' + label + '</th>' : '<strong>' + label + '</strong>'
+  let i = html.indexOf(open)
+  if (i === -1) return null
+  const from = i + open.length
+  const td = html.indexOf('<td', from)
+  if (td === -1 || td - from > 600) return null
+  const close = html.indexOf('</td>', td)
+  if (close === -1) return null
+  return stripTags(html.slice(td, close)).replace(/\s+/g, ' ').trim()
+}
+
+// ফলব্যাক: সব occurrence লুপ, উইন্ডো চওড়া
 function nearVal(html, label, re) {
-  const i = html.indexOf(label)
-  if (i === -1) return ''
-  const seg = stripTags(html.slice(i + label.length, i + label.length + 170)).replace(/\s+/g, ' ')
-  const m = seg.match(re)
-  return m ? m[1].toUpperCase() : ''
+  const lc = html.indexOf(label)
+  if (lc === -1) return ''
+  let i = lc
+  while (i !== -1) {
+    const seg = stripTags(html.slice(i + label.length, i + label.length + 400)).replace(/\s+/g, ' ')
+    const m = seg.match(re)
+    if (m) return m[1].toUpperCase()
+    i = html.indexOf(label, i + label.length)
+  }
+  return ''
 }
 
 const YN = /\b(Yes|No|N\/A|True|False)\b/i
+const pick = (cell, re, fb) => {
+  const c = cell || ''
+  const m = c.match(re)
+  return m ? m[1].toUpperCase() : fb
+}
 
 function parseSl(t) {
   if (!t) return null
-  const o = { vpn: nearVal(t, 'Anonymizing VPN', YN),
-              rproxy: nearVal(t, 'Residential Proxy', YN),
-              dc: nearVal(t, 'Datacenter', YN) }
+  const o = {
+    vpn: pick(cellOf(t, 'Anonymizing VPN', 'th'), YN, nearVal(t, 'Anonymizing VPN', YN)),
+    rproxy: pick(cellOf(t, 'Residential Proxy', 'th'), YN, nearVal(t, 'Residential Proxy', YN)),
+    dc: pick(cellOf(t, 'Datacenter', 'th'), YN, nearVal(t, 'Datacenter', YN))
+  }
   return (o.vpn || o.dc || o.rproxy) ? o : null
 }
 
-function nearSeen(html, label) {
-  const i = html.indexOf(label)
+function seenOf(t) {
+  const c = cellOf(t, 'Last Seen', 'strong') || ''
+  const s = c.replace(/^[\s|:*#-]+/, '').trim()
+  const m = s.match(new RegExp(String.raw`^(?:-|\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago|\d{4}-\d{2}-\d{2})`, 'i'))
+  if (m) return m[0]
+  const i = t.indexOf('Last Seen')
   if (i === -1) return ''
-  const seg = stripTags(html.slice(i + label.length, i + label.length + 140))
-    .replace(/\s+/g, ' ').replace(/^[\s|:*#-]+/, '').trim()
-  const m = seg.match(new RegExp(String.raw`^(?:-|\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago|\d{4}-\d{2}-\d{2})`, 'i'))
-  return m ? m[0] : ''
+  const seg = stripTags(t.slice(i + 9, i + 300)).replace(/\s+/g, ' ').replace(/^[\s|:*#-]+/, '').trim()
+  const m2 = seg.match(new RegExp(String.raw`^(?:-|\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago|\d{4}-\d{2}-\d{2})`, 'i'))
+  return m2 ? m2[0] : ''
 }
 
 function parseI2l(t) {
   if (!t) return null
-  const o = { anon: nearVal(t, 'Anonymous Proxy', YN),
-              seen: nearSeen(t, 'Last Seen'),
-              fraud: nearVal(t, 'Fraud Score', /(\d{1,3})/) }
-  if (!(o.anon || o.fraud || o.seen)) {
+  const anon = pick(cellOf(t, 'Anonymous Proxy', 'strong'), YN, nearVal(t, 'Anonymous Proxy', YN))
+  const fraud = pick(cellOf(t, 'Fraud Score', 'strong'), /(\d{1,3})/, nearVal(t, 'Fraud Score', /(\d{1,3})/))
+  const seen = seenOf(t)
+  if (!(anon || fraud || seen)) {
     const f = t.match(/"fraud_score"\s*:\s*(\d{1,3})/i)
     const p = t.match(/"is_proxy"\s*:\s*(true|false)/i)
     if (!f && !p) return null
     return { anon: p ? (p[1].toLowerCase() === 'true' ? 'YES' : 'NO') : '', seen: '', fraud: f ? f[1] : '' }
   }
-  return o
+  return { anon, seen, fraud }
 }
 
 const yn = v => ({ YES: 'YES', TRUE: 'YES', NO: 'NO', FALSE: 'NO', 'N/A': 'N/A' }[String(v || '').trim().toUpperCase()] || '')
@@ -440,7 +468,7 @@ function i2lVerdict(p) {
   return ['PASS', `anon=No fraud=${fv} seen='${seen || '-'}'`]
 }
 
-// ---------- MaxMind (একমাত্র CT সোর্স) ----------
+// ---------- MaxMind (একমাত্র CT সোর্স, ২৫ IP ব্যাচ) ----------
 function normCt(v) {
   const s = String(v || '').trim().toLowerCase()
   if (s.includes('cable') || s.includes('dsl')) return 'Cable/DSL'
@@ -454,7 +482,7 @@ function normCt(v) {
 const js = (s, k) => { const m = String(s || '').match(new RegExp('"' + k + '"\\s*:\\s*"([^"]*)"', 'i')); return m ? m[1] : '' }
 const jn = (s, k) => { const m = String(s || '').match(new RegExp('"' + k + '"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)', 'i')); return m ? m[1] : '' }
 
-// HTML <tr><td>… অথবা markdown | … | — দুটোই একই ইনডেক্স লেআউট
+// একই রো-এর সেল (HTML <tr> বা markdown | |)
 function rowCells(t, ip) {
   let i = t.indexOf('geoip-web-services-demo/' + ip)
   if (i === -1) i = t.indexOf('>' + ip + '<')
@@ -516,60 +544,75 @@ function parseMm(t, ip) {
   return (o.ct || o.asn || o.isp) ? o : null
 }
 
-async function mmInfo(ip, worker) {
+// স্থায়ী ক্যাশ
+async function cdnRead(ip) {
+  try {
+    const r = await caches.default.match('https://mm-cache.internal/' + ip)
+    return r ? await r.json() : null
+  } catch { return null }
+}
+function cdnWrite(ip, v) {
+  try {
+    caches.default.put('https://mm-cache.internal/' + ip,
+      new Response(JSON.stringify(v), { headers: { 'Cache-Control': 'max-age=604800' } }))
+  } catch {}
+}
+
+// ব্যাচ কিউ
+let BATCH = []
+let BTIMER = null
+
+function mmEnqueue(ip) {
+  return new Promise(res => {
+    BATCH.push({ ip, res })
+    if (BATCH.length >= BATCH_MAX) flushBatch()
+    else if (!BTIMER) BTIMER = setTimeout(flushBatch, BATCH_WAIT)
+  })
+}
+
+async function flushBatch() {
+  if (BTIMER) { clearTimeout(BTIMER); BTIMER = null }
+  const jobs = BATCH
+  BATCH = []
+  if (!jobs.length) return
+  const ips = jobs.map(j => j.ip)
+  const url = MM_BULK(ips)
+  let text = await page(url, ips[0])
+  if (!text) text = await viaRelay(url, ips[0])
+  if (!text) {
+    for (const j of jobs) { memSet('mmx:' + j.ip, 1); j.res(null) }
+    return
+  }
+  for (const j of jobs) {
+    const v = parseMm(text, j.ip)
+    if (v && v.ct) { memSet('mm:' + j.ip, v); cdnWrite(j.ip, v) } else memSet('mmx:' + j.ip, 1)
+    j.res(v || null)
+  }
+}
+
+async function mmInfo(ip) {
   const hit = memGet('mm:' + ip, CT_TTL)
   if (hit) return hit
   if (memGet('mmx:' + ip, CTX_TTL)) return null
   if (inflight.has(ip)) return inflight.get(ip)
 
   const pr = (async () => {
-    const urls = MM_URLS(ip)
-    let out = null
-
-    // ১) নিজের Worker হয়ে
-    if (worker) {
-      for (const u of urls) {
-        const t = await viaWorker(worker, u, ip)
-        if (!t) continue
-        const v = parseMm(t, ip)
-        if (v) { out = v; if (v.ct) break }
-      }
+    const c = await cdnRead(ip)
+    if (c && c.ct) { memSet('mm:' + ip, c); return c }
+    const v = await mmEnqueue(ip)
+    if (!v) {
+      const one = await page(MM_ONE(ip), ip)
+      const s = one ? parseMm(one, ip) : null
+      if (s && s.ct) { memSet('mm:' + ip, s); cdnWrite(ip, s); return s }
     }
-    // ২) সরাসরি
-    if (!out || !out.ct) {
-      for (const u of urls) {
-        const t = await page(u, ip)
-        if (!t) continue
-        const v = parseMm(t, ip)
-        if (v) { out = v; if (v.ct) break }
-      }
-    }
-    // ৩) রিলে
-    if (!out || !out.ct) {
-      for (const u of urls.slice(0, 1)) {
-        const t = await viaRelay(u, ip)
-        if (!t) continue
-        const v = parseMm(t, ip)
-        if (v) { out = v; if (v.ct) break }
-      }
-    }
-    // ৪) আরেকবার, ভিন্ন UA
-    if (!out || !out.ct) {
-      const t = await page(urls[0], ip)
-      const v = t ? parseMm(t, ip) : null
-      if (v) out = v
-    }
-
-    if (out && out.ct) memSet('mm:' + ip, out)
-    else memSet('mmx:' + ip, 1)
-    return out
+    return v
   })()
 
   inflight.set(ip, pr)
   try { return await pr } finally { inflight.delete(ip) }
 }
 
-// ---------- ঐচ্ছিক: ipapi.is (শুধু ভের্ডিক্ট ফ্ল্যাগ, CT নয়) ----------
+// ---------- ঐচ্ছিক: ipapi.is (শুধু ভের্ডিক্ট ফ্ল্যাগ) ----------
 async function ipapiIs(ip, key) {
   const c = memGet('api:' + ip, CT_TTL)
   if (c !== undefined) return c
@@ -657,7 +700,7 @@ async function viaWorker(worker, target, ip) {
 async function page(url, ip) {
   const hdr = url.includes('maxmind') ? MM_HDR() : HTML_HDR()
   for (let i = 0; i < 2; i++) {
-    const t = await requestText(url, { timeout: 4500, minLen: 800, needIp: ip, headers: hdr })
+    const t = await requestText(url, { timeout: 5000, minLen: 800, needIp: ip, headers: hdr })
     if (t && !t.slice(0, 3000).toLowerCase().includes('just a moment')) return t
     await sleep(200 * (i + 1))
   }
@@ -727,7 +770,7 @@ async function run(request) {
     const [slR, i2lR, mm] = await Promise.all([
       timed(getSl(rec.ip, worker), wait),
       timed(getI2l(rec.ip, worker), wait),
-      timed(mmInfo(rec.ip, worker), wait)
+      timed(mmInfo(rec.ip), wait)
     ])
 
     const [sl, ssrc] = slR || [null, 'none']
@@ -841,7 +884,7 @@ export default {
       const sp = new URL(request.url).searchParams
       if (sp.has('probe')) return probe(request)
       const node = typeof process !== 'undefined' ? process.version : 'n/a'
-      return json(sp.has('health') ? { ok: true, node, ct: 'maxmind', rt: 'sockets' } : { ok: true })
+      return json(sp.has('health') ? { ok: true, node, ct: 'maxmind-batch', rt: 'sockets' } : { ok: true })
     }
     if (pathname === '/api/page') return pageProxy(request)
     if (pathname === '/api/probe') return probe(request)
