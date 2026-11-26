@@ -7,6 +7,10 @@ const ECHO_MIN = 4000
 const CAP = 900_000
 const MM_BATCH_MAX = 25
 const MM_BATCH_WAIT = 1200
+const API_BATCH = 'http://ip-api.com/batch?fields=status,mobile,proxy,hosting,isp,org,as,query'
+const API_BATCH_MAX = 100
+const API_BATCH_WAIT = 700
+const API_GAP = 4200
 
 const UAS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -25,7 +29,6 @@ const I2L_PAGE = ip => 'https://www.ip2location.com/demo/' + encodeURIComponent(
 const MM_BULK = ips => 'https://www.maxmind.com/en/geoip-web-services-demo?ip_address=' +
   ips.map(encodeURIComponent).join(',')
 const MM_ONE = ip => 'https://www.maxmind.com/en/geoip-web-services-demo/' + encodeURIComponent(ip)
-const API_BATCH = 'http://ip-api.com/batch?fields=status,mobile,proxy,hosting,isp,org,as,query'
 const ALLOW = /^https:\/\/(?:www\.)?(?:maxmind\.com|scamalytics\.com|ip2location\.com)\//
 const IPAPI_IS = (ip, key) => `https://api.ipapi.is/?q=${encodeURIComponent(ip)}&key=${encodeURIComponent(key)}`
 
@@ -633,11 +636,6 @@ async function mmInfo(ip) {
 }
 
 // ---------- ip-api.com — শুধু ভের্ডিক্ট ফ্ল্যাগের জন্য ----------
-const API_BATCH = 'http://ip-api.com/batch?fields=status,mobile,proxy,hosting,isp,org,as,query'
-const API_BATCH_MAX = 100
-const API_BATCH_WAIT = 700
-const API_GAP = 4200
-
 let APIB = []
 let APIT = null
 let APILAST = 0
