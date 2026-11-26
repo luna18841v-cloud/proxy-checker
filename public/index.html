@@ -47,6 +47,7 @@
   .pip{font-size:11px;color:var(--dm);font-family:ui-monospace,Menlo,Consolas,monospace}
   .src{font-size:10px;color:var(--oktx)}
   .src.b{color:var(--dm)}
+  .srcb{font-size:10px;color:var(--dm)}
   .secs{margin-left:auto;font-size:11px;color:var(--dm)}
   .idet{margin-top:7px;display:flex;gap:4px 14px;flex-wrap:wrap;font-size:12px;color:var(--dm)}
   .kv b{font-weight:800}
@@ -58,7 +59,7 @@
 <body>
 <header>
   <h1>PROXY CHECKER</h1>
-  <small>Theme: Bubblegum — PASS = VPN No · Datacenter No · AnonymousProxy No · LastSeen খালি/0/- · Fraud &lt; 20</small>
+  <small>PASS = VPN No · Datacenter No · AnonymousProxy No · LastSeen খালি/0/- · Fraud &lt; 20</small>
 </header>
 
 <main>
@@ -72,6 +73,7 @@
     <div class="row" style="margin-top:12px">
       <div class="f sm"><label>ফাইল</label><input type="file" id="file" accept=".txt,.csv"></div>
       <div class="f" style="flex:2 1 320px"><label>Worker URL (খালি = সরাসরি ফেচ)</label><input id="worker" placeholder="https://&lt;your-worker&gt;.workers.dev"></div>
+      <div class="f" style="flex:2 1 260px"><label>ipapi.is key (ঐচ্ছিক — শুধু ভের্ডিক্ট ফ্ল্যাগ)</label><input id="key" placeholder="free key → ipapi.is/app/signup"></div>
       <div class="f sm"><label>Concurrency</label><input id="conc" type="number" min="1" max="500" value="40"></div>
       <div class="f sm"><label>Timeout (s)</label><input id="timeout" type="number" min="4" max="20" value="8"></div>
     </div>
@@ -82,6 +84,7 @@
       <button id="test">ফাংশন টেস্ট</button>
       <span class="hint" id="parsed"></span>
     </div>
+    <div class="hint">Cable/DSL ও Cellular শুধুই MaxMind থেকে নেওয়া হয় (পাথ URL + ?ip_address= ভ্যারিয়েন্ট, Worker রিলে, রিলে ফলব্যাক, ১২ ঘণ্টা ক্যাশ)। Worker URL-এ নিজের ডিপ্লয় করা ঠিকানা দিলে ব্লক অনেক কমে। ipapi.is কী শুধু স্ক্র্যাপ ব্লক হলে ভের্ডিক্ট ঠিক করতে ব্যবহৃত হয় — CT-তে হাত দেয় না।</div>
   </div>
 
   <div class="panel">
@@ -121,6 +124,6 @@
   <div id="list"></div>
 </main>
 
-<script src="/app.js" defer></script>
+<script src="/index.js" defer></script>
 </body>
 </html>
