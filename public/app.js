@@ -1,5 +1,6 @@
 const FN = '/api/check'
-const HARD_MS = 30000
+const HARD_MS = 45000
+const KEY_LS = 'pc_key'
 
 const $ = s => document.querySelector(s)
 const list = $('#list')
@@ -41,6 +42,9 @@ $('#file').addEventListener('change', async e => {
   $('#proxies').value = await f.text()
   $('#parsed').textContent = `বৈধ: ${readList().length}`
 })
+
+$('#key').value = localStorage.getItem(KEY_LS) || ''
+$('#key').addEventListener('change', () => localStorage.setItem(KEY_LS, $('#key').value.trim()))
 
 const esc = s => String(s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
 const U = v => String(v || '').trim().toUpperCase()
@@ -99,6 +103,8 @@ function sharedOf(r) {
   return '100+ (Crowded)'
 }
 
+const srcBadge = s => `<span class="src ${!s || s === 'none' ? 'b' : ''}">${esc(s || 'none')}</span>`
+
 function card(r) {
   const v = U(r.verdict) || 'UNKNOWN'
   const vcls = v === 'PASS' ? 'pass' : v === 'FAIL' ? 'fail' : v === 'UNKNOWN' ? 'unk' : 'dead'
@@ -106,7 +112,6 @@ function card(r) {
   const native = it === 'Residential' || it === 'Cellular' ? 'Native IP' : 'Non-Native IP'
   const n = riskOf(r)
   const band = BANDS.find(x => n < x[0]) || BANDS[4]
-  const blocked = !r.src || r.src.split('/')[0] === 'none'
   const ipLink = r.ip ? `<a class="lnk" href="https://ping0.cc/ip/${esc(r.ip)}" target="_blank" rel="noopener">${esc(r.ip)}</a>` : '—'
 
   return `<div class="item">
@@ -114,7 +119,8 @@ function card(r) {
       <span class="pv">${esc(r.proxy)}</span>
       <span class="vd ${vcls}">${esc(v)}</span>
       ${r.ip ? `<span class="pip">${esc(r.ip)}</span>` : ''}
-      <span class="src ${blocked ? 'b' : ''}">${blocked ? 'blocked' : 'live'}</span>
+      <span class="srcb">sl ${srcBadge(r.sl_src)}</span>
+      <span class="srcb">i2l ${srcBadge(r.i2l_src)}</span>
       <span class="secs">${esc(r.secs)}s</span>
     </div>
     <div class="idet">
@@ -126,9 +132,12 @@ function card(r) {
       ${kv('Last Seen', esc(r.i2l_seen || '-'))}
       ${kv('Fraud Score', esc(r.i2l_fraud || '—'))}
       ${kv('Connection type', esc(r.mm_ct || '—'))}
+      ${kv('CT Source', esc(r.ct_src || '—'))}
+      ${kv('API flags', esc(r.api_flags || '—'))}
       ${kv('ASN', esc(r.mm_asn || '—'))}
       ${kv('ASN Owner', esc(r.mm_asnorg || '—'))}
       ${kv('Organization', esc(r.mm_org || r.mm_isp || '—'))}
+      ${kv('Network', esc(r.mm_net || '—'))}
       ${kv('Longitude', esc(r.mm_lon || '—'))}
       ${kv('Latitude', esc(r.mm_lat || '—'))}
       ${kv('IP Type', esc(it))}
@@ -192,6 +201,7 @@ function resCount() {
 
 async function checkOne(p) {
   const worker = $('#worker').value.trim()
+  const key = $('#key').value.trim()
   const timeout = Math.min(Math.max(Number($('#timeout').value) || 8, 4), 20)
   const t = Date.now()
 
@@ -203,7 +213,7 @@ async function checkOne(p) {
       const res = await fetch(FN, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ proxy: p.raw, worker, timeout }),
+        body: JSON.stringify({ proxy: p.raw, worker, key, timeout }),
         signal: ctl.signal
       })
       clearTimeout(timer)
@@ -213,7 +223,8 @@ async function checkOne(p) {
       if (!j) {
         return { proxy: p.raw, scheme: '', ip: '', verdict: 'ERROR',
                  reasons: `http ${res.status} ${raw.slice(0, 80).replace(/\s+/g, ' ')}`,
-                 src: '', secs: 0, sl_vpn: '', sl_rproxy: '', sl_dc: '', i2l_anon: '' }
+                 src: '', sl_src: 'none', i2l_src: 'none', ct_src: '',
+                 secs: 0, sl_vpn: '', sl_rproxy: '', sl_dc: '', i2l_anon: '' }
       }
       if (res.status === 429 || res.status >= 500) {
         n429++
@@ -235,7 +246,8 @@ async function checkOne(p) {
       clearTimeout(timer)
       if (attempt < 2) { await sleep(500 * (attempt + 1)); continue }
       return { proxy: p.raw, scheme: '', ip: '', verdict: 'ERROR', reasons: e.name,
-               src: '', secs: 0, sl_vpn: '', sl_rproxy: '', sl_dc: '', i2l_anon: '' }
+               src: '', sl_src: 'none', i2l_src: 'none', ct_src: '',
+               secs: 0, sl_vpn: '', sl_rproxy: '', sl_dc: '', i2l_anon: '' }
     }
   }
 }
@@ -309,8 +321,9 @@ const passRows = () => all().filter(r => r.verdict === 'PASS')
 const resRows = v => all().filter(r => U(r.sl_rproxy) === v)
 const ctRows = v => all().filter(r => r.mm_ct === v)
 const csvCell = v => `"${String(v ?? '').replace(/"/g, '""')}"`
-const FIELDS = ['proxy', 'scheme', 'ip', 'verdict', 'reasons', 'src', 'sl_vpn', 'sl_rproxy', 'sl_dc',
-                'i2l_anon', 'i2l_fraud', 'i2l_seen', 'mm_ct', 'mm_asn', 'mm_asnorg', 'mm_org', 'secs']
+const FIELDS = ['proxy', 'scheme', 'ip', 'verdict', 'reasons', 'src', 'sl_src', 'i2l_src', 'ct_src',
+                'sl_vpn', 'sl_rproxy', 'sl_dc', 'i2l_anon', 'i2l_fraud', 'i2l_seen', 'api_flags',
+                'mm_ct', 'mm_asn', 'mm_asnorg', 'mm_isp', 'mm_org', 'mm_lat', 'mm_lon', 'mm_net', 'secs']
 
 $('#dl-csv').addEventListener('click', () => download('all.csv',
   [FIELDS.join(','), ...all().map(r => FIELDS.map(f => csvCell(r[f])).join(','))].join('\n'), 'text/csv'))
