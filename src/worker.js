@@ -13,9 +13,15 @@ const JSON_HDR = { 'User-Agent': UA, 'Accept': 'application/json,*/*;q=0.8' }
 const SL_PAGE = ip => 'https://scamalytics.com/ip/' + encodeURIComponent(ip)
 const I2L_PAGE = ip => 'https://www.ip2location.com/demo/' + encodeURIComponent(ip)
 const MM_PAGE = ip => 'https://www.maxmind.com/en/geoip-web-services-demo/' + encodeURIComponent(ip)
-const IP_ECHO = ['https://api.ipify.org?format=json', 'https://api64.ipify.org?format=json',
+
+// ধাপ ১: প্লেইন HTTP — TLS ছাড়া, দ্রুত
+const ECHO_HTTP = ['http://api.ipify.org/?format=json', 'http://checkip.amazonaws.com/',
+  'http://icanhazip.com/', 'http://ip-api.com/json/?fields=query', 'http://ifconfig.me/ip']
+// ধাপ ২: HTTPS — প্লেইন HTTP ফেল করলে
+const ECHO_HTTPS = ['https://api.ipify.org?format=json', 'https://api64.ipify.org?format=json',
   'https://api.ipapi.is/', 'https://ipapi.co/ip/', 'https://ifconfig.me/all.json',
   'https://icanhazip.com/', 'https://checkip.amazonaws.com/']
+
 const PRE = String.raw`\|\s*(?:-\s*\[[ xX]\]\s*)?\**\s*`
 const SEEN_ALT = String.raw`\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago`
 const relays = u => ['https://r.jina.ai/' + u,
@@ -79,11 +85,11 @@ class RawSock {
   }
   async startTls(host) {
     try { if (this._wq) await this._wq } catch {}
-    try { await this._reader.cancel() } catch {}
-    try { this._reader.releaseLock() } catch {}
-    try { this._writer.releaseLock() } catch {}
     this._dead = true
     this._h = { data: [], error: [], close: [] }
+    // cancel() সকেট বন্ধ করে দেয় — তাই শুধু lock ছাড়ছি
+    try { this._reader.releaseLock() } catch {}
+    try { this._writer.releaseLock() } catch {}
     const open = o => { try { return this._s.startTls(o) } catch { return null } }
     const cf = open({ expectedServerHostname: host }) || open({ servername: host }) || this._s.startTls()
     const s = new RawSock(cf)
@@ -506,7 +512,10 @@ async function tryEcho(p, urls, timeout) {
     const t = await requestText(url, { proxy: p, timeout, headers: JSON_HDR })
     if (!t) continue
     let ip = ''
-    try { const j = JSON.parse(t); ip = validIp(j.ip || j.ipAddress || j.ip_addr || '') } catch {}
+    try {
+      const j = JSON.parse(t)
+      ip = validIp(j.ip || j.ipAddress || j.ip_addr || j.query || '')
+    } catch {}
     if (!ip) { const m = t.match(/\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}/); ip = validIp(m ? m[0] : '') }
     if (!ip) { const m = t.match(/[0-9a-f]{1,4}(?::[0-9a-f]{0,4}){2,7}/i); ip = validIp(m ? m[0] : '') }
     if (ip) return ip
@@ -523,17 +532,27 @@ function firstOk(tasks) {
 }
 
 async function exitIp(p, budget) {
-  const urls = [...IP_ECHO].sort(() => Math.random() - 0.5)
   const per = Math.min(12000, Math.max(ECHO_MIN, Math.round(budget * 500)))
   const socksFirst = p.scheme === 'socks5' || p.scheme === 'socks4'
   const A = socksFirst ? 'socks5' : 'http'
   const B = socksFirst ? 'http' : 'socks5'
+
+  // ধাপ ১: প্লেইন HTTP — TLS লাগে না
+  const plain = [...ECHO_HTTP].sort(() => Math.random() - 0.5)
+  const p1 = await firstOk([
+    tryEcho({ ...p, scheme: A }, plain.slice(0, 2), per).then(ip => ip && { ip, scheme: A }),
+    tryEcho({ ...p, scheme: B }, plain.slice(2, 3), per).then(ip => ip && { ip, scheme: B })
+  ])
+  if (p1) return p1
+
+  // ধাপ ২: HTTPS (TLS)
+  const tlsUrls = [...ECHO_HTTPS].sort(() => Math.random() - 0.5)
   const got = await firstOk([
-    tryEcho({ ...p, scheme: A }, urls.slice(0, 1), per).then(ip => ip && { ip, scheme: A }),
-    tryEcho({ ...p, scheme: B }, urls.slice(1, 2), per).then(ip => ip && { ip, scheme: B })
+    tryEcho({ ...p, scheme: A }, tlsUrls.slice(0, 1), per).then(ip => ip && { ip, scheme: A }),
+    tryEcho({ ...p, scheme: B }, tlsUrls.slice(1, 2), per).then(ip => ip && { ip, scheme: B })
   ])
   if (got) return got
-  const rest = await tryEcho({ ...p, scheme: A }, urls.slice(2, 4), per)
+  const rest = await tryEcho({ ...p, scheme: A }, tlsUrls.slice(2, 4), per)
   return rest ? { ip: rest, scheme: A } : null
 }
 
@@ -588,22 +607,37 @@ const json = b => new Response(JSON.stringify(b), { status: 200, headers: {
 // ---------- ডায়াগনস্টিক ----------
 async function probe(request) {
   const q = new URL(request.url).searchParams
-  const p = parseProxy(q.get('proxy') || '')
-  if (!p) return json({ error: 'invalid proxy', got: q.get('proxy') || '' })
-  const t0 = Date.now(), out = { host: p.host, port: p.port, scheme: p.scheme || 'http' }
+  const raw = q.get('proxy') || ''
+  const p = parseProxy(raw)
+  if (!p) return json({ error: 'invalid proxy', got: raw })
+  const t0 = Date.now()
+  const out = { host: p.host, port: p.port, scheme: p.scheme || 'http', hasAuth: !!p.user }
   try {
     const s = await openTcp(p.host, p.port, 8000)
     out.tcp = 'ok'
+    s.destroy()
+  } catch (e) {
+    out.tcpErr = `${e.name}: ${e.message}`
+    out.ms = Date.now() - t0
+    return json(out)
+  }
+  try {
+    const t = await tunnel(p, 'api.ipify.org', 443, 8000)
+    out.tunnel = 'ok'
     try {
-      const t = await tunnel(p, 'api.ipify.org', 443, 8000)
-      out.tunnel = 'ok'
+      const plain = await requestText('http://checkip.amazonaws.com/', { proxy: p, timeout: 8000 })
+      out.plainHttp = plain ? 'ok :: ' + plain.trim().slice(0, 40) : 'fail'
+    } catch (e) { out.plainHttp = 'err ' + e.name }
+    try {
       const tls = await tlsWrap(t, 'api.ipify.org')
       out.tls = 'ok'
       const r = await rawRequest(tls, { host: 'api.ipify.org', path: '/?format=json',
                                         headers: JSON_HDR, timeout: 8000 })
-      out.http = r ? `status ${r.status} :: ${r.body.toString().slice(0, 80)}` : 'no response'
-    } catch (e) { out.tunnelErr = `${e.name}: ${e.message}` }
-  } catch (e) { out.tcpErr = `${e.name}: ${e.message}` }
+      out.https = r ? `status ${r.status} :: ${r.body.toString().slice(0, 60)}` : 'no response'
+    } catch (e) { out.tlsErr = `${e.name}: ${e.message}` }
+  } catch (e) {
+    out.tunnelErr = `${e.name}: ${e.message}`
+  }
   out.ms = Date.now() - t0
   return json(out)
 }
