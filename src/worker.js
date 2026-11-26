@@ -32,7 +32,6 @@ const MM_ONE = ip => 'https://www.maxmind.com/en/geoip-web-services-demo/' + enc
 const ALLOW = /^https:\/\/(?:www\.)?(?:maxmind\.com|scamalytics\.com|ip2location\.com)\//
 const IPAPI_IS = (ip, key) => `https://api.ipapi.is/?q=${encodeURIComponent(ip)}&key=${encodeURIComponent(key)}`
 
-// প্রতিটা রিলে আলাদা egress — সবগুলো একসাথে চালানো হয়
 const MM_RELAYS = [
   u => 'https://r.jina.ai/' + u,
   u => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
@@ -66,8 +65,11 @@ const CT_ANY = /(Cable\/DSL|Cellular|Corporate|Satellite)/i
 const CT_HIT = /connection_type|Connection Type/i
 const LIMIT_RE = /reached[^.]{0,40}limit|too many requests|25 IP addresses/i
 
-const CELL_RE = /(mobile|cellular|wireless|\bgsm\b|\blte\b|\b5g\b|\b4g\b|umts|cdma|telecom|telenor|vodafone|telefonica|airtel|\bjio\b|claro|\btim\b|\bvivo\b|\bmtn\b|zain|etisalat|cellcom|proximus|\bkpn\b|swisscom|telstra|optus|singtel|turkcell|telia|elisa|safaricom|mobifone|telkomsel|indosat|beeline|megafon|\bmts\b|kcell|azercell|\bo2\b|orange)/i
-const DC_RE = /(hosting|datacenter|data center|\bvps\b|cloud|server|colo|amazon|aws|google|azure|microsoft|digitalocean|linode|ovh|hetzner|contabo|vultr|oracle|alibaba|tencent|leaseweb|m247|choopa|cogent|scaleway)/i
+// মোবাইল — শুধু আসল মোবাইল সিগন্যাল
+const CELL_RE = /\b(mobile|cellular|wireless|gsm|lte|4g|5g|umts|cdma|gprs)\b|t-?mobile|airtel|\bjio\b|claro|cellcom|zain|etisalat|turkcell|kcell|azercell|megafon|beeline|telkomsel|indosat|smartfren|dtac|\bais\b|true ?move|maxis|celcom|\bdigi\b|mobifone|viettel|docomo|softbank/i
+// ফিক্সড লাইন / রেসিডেন্সিয়াল ISP
+const FIXED_RE = /(telecom|telekom|communications|unicom|broadband|fiber|fibre|ftth|cable|dsl|adsl|vdsl|\bisp\b|internet|networks?|comcast|charter|spectrum|\bcox\b|virgin|sky\b|\bbt\b|verizon|at&t|centurylink|frontier|windstream|telus|bell\b|rogers|telstra|optus|\btpg\b|\bsfr\b|bouygues|orange|telefonica|telia|telenor|elisa|\bkpn\b|proximus|swisscom|chinanet|ntt|kddi|j:com)/i
+const DC_RE = /(hosting|datacenter|data ?center|\bvps\b|cloud|server|colo|amazon|aws|google|azure|microsoft|digitalocean|linode|ovh|hetzner|contabo|vultr|oracle|alibaba|tencent|leaseweb|m247|choopa|cogent|scaleway)/i
 
 const FIELDS = ['proxy', 'scheme', 'ip', 'verdict', 'reasons', 'src', 'sl_src', 'i2l_src', 'ct_src',
                 'sl_vpn', 'sl_rproxy', 'sl_dc', 'i2l_anon', 'i2l_fraud', 'i2l_seen', 'api_flags',
@@ -475,7 +477,7 @@ function i2lVerdict(p) {
 function normCt(v) {
   const s = String(v || '').trim().toLowerCase()
   if (s.includes('cable') || s.includes('dsl')) return 'Cable/DSL'
-  if (s.includes('cell')) return 'Cellular'
+  if (s.includes('cell') || s.includes('mob')) return 'Cellular'
   if (s.includes('corp')) return 'Corporate'
   if (s.includes('sat')) return 'Satellite'
   if (s.includes('data') || s.includes('host')) return 'Data Center'
@@ -503,7 +505,6 @@ function rowCells(t, ip) {
   return cells
 }
 
-// পেজের ভেতরের JSON ব্লক (<pre> … "connection_type" …)
 function mmPreJson(t, ip) {
   const i = t.indexOf('"connection_type"')
   if (i === -1) return null
@@ -511,10 +512,9 @@ function mmPreJson(t, ip) {
   const pe = t.indexOf('</pre>', i)
   if (ps === -1 || pe === -1) return null
   const raw = deEnt(t.slice(ps, pe))
-  const o = { ct: '', asn: '', asnorg: '', isp: '', org: '', lat: '', lon: '', net: '' }
   const ct = raw.match(CT_RE)
   if (!ct) return null
-  o.ct = normCt(ct[1])
+  const o = { ct: normCt(ct[1]), asn: '', asnorg: '', isp: '', org: '', lat: '', lon: '', net: '' }
   const tip = raw.indexOf('"traits"')
   if (tip !== -1) {
     const seg = raw.slice(tip, tip + 1600)
@@ -528,7 +528,6 @@ function mmPreJson(t, ip) {
   return o
 }
 
-// রিলে-টেক্সট: "Label: value" / "Label | value" লাইন
 const MM_LABELS = [
   ['connection type', 'ct'],
   ['isp / organization', 'isp'],
@@ -540,16 +539,14 @@ const MM_LABELS = [
   ['postal code', 'net'],
   ['approximate latitude / longitude', 'geo'],
   ['coordinates', 'geo'],
-  ['accuracy radius', 'net'],
-  ['timezone', 'net']
+  ['accuracy radius', 'net']
 ]
 const mmNormLbl = s => stripTags(s || '').replace(/\*/g, ' ').replace(/\(desc\??\)/gi, ' ')
   .replace(/\s+/g, ' ').trim().toLowerCase()
 
 function mmPlain(t) {
   const o = { ct: '', asn: '', asnorg: '', isp: '', org: '', lat: '', lon: '', net: '' }
-  const lines = String(t || '').split(/\r?\n/)
-  for (let ln of lines) {
+  for (let ln of String(t || '').split(/\r?\n/)) {
     ln = ln.replace(/!\[[^\]]*\]\([^)]*\)/g, ' ')
       .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
       .replace(/\*\*/g, '').replace(/^[\s>*\-\u2022|]+/, '').replace(/\s+/g, ' ').trim()
@@ -557,7 +554,7 @@ function mmPlain(t) {
     const low = mmNormLbl(ln)
     for (const [lab, key] of MM_LABELS) {
       if (!low.startsWith(lab)) continue
-      let rest = ln.slice(lab.length).replace(/^[\s:|\-\u2013\u2014]+/, '').trim()
+      const rest = ln.slice(lab.length).replace(/^[\s:|\-\u2013\u2014]+/, '').trim()
       if (!rest || rest === '-') break
       if (key === 'ct') { const c = normCt(rest); if (c && !o.ct) o.ct = c }
       else if (key === 'geo') {
@@ -635,7 +632,6 @@ function cdnWrite(ip, v) {
   } catch {}
 }
 
-// সব রিলে + ডাইরেক্ট একসাথে, প্রথম যেটা CT দেয় সেটাই
 let MM_LIMIT_AT = 0
 
 async function fetchMm(url, ip) {
@@ -791,13 +787,16 @@ async function ipapiIs(ip, key) {
 }
 
 // ---------- টাইপ নির্ণয় ----------
-function deriveCt(org, dcFlag, mobileFlag) {
+// ক্রম: MaxMind → satellite → datacenter → mobile ফ্ল্যাগ → মোবাইল নাম → ফিক্সড-লাইন নাম → ডিফল্ট Cable/DSL
+function deriveCt(org, dcFlag, mobileFlag, satFlag) {
+  if (satFlag) return 'Satellite'
   if (dcFlag) return 'Data Center'
   if (mobileFlag) return 'Cellular'
   if (!org) return ''
-  if (CELL_RE.test(org)) return 'Cellular'
   if (DC_RE.test(org)) return 'Data Center'
-  return ''
+  if (CELL_RE.test(org)) return 'Cellular'
+  if (FIXED_RE.test(org)) return 'Cable/DSL'
+  return 'Cable/DSL'
 }
 
 async function connType(ip, key) {
@@ -833,7 +832,8 @@ async function connType(ip, key) {
     if (a) r.api = { ...(r.api || {}), ...a }
 
     if (!r.ct) {
-      const d = deriveCt(r.asnorg || r.org || r.isp, r.api && r.api.is_datacenter, r.api && r.api.is_mobile)
+      const org = r.asnorg || r.org || r.isp
+      const d = deriveCt(org, r.api && r.api.is_datacenter, r.api && r.api.is_mobile, false)
       if (d) { r.ct = d; r.src = 'derived' }
     }
 
