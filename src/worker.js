@@ -5,8 +5,8 @@ const FRAUD_MAX = 20
 const SEEN_OK = new Set(['', '-', '0'])
 const ECHO_MIN = 4000
 const CAP = 900_000
-const BATCH_MAX = 25
-const BATCH_WAIT = 1200
+const MM_BATCH_MAX = 25
+const MM_BATCH_WAIT = 1200
 
 const UAS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -25,8 +25,21 @@ const I2L_PAGE = ip => 'https://www.ip2location.com/demo/' + encodeURIComponent(
 const MM_BULK = ips => 'https://www.maxmind.com/en/geoip-web-services-demo?ip_address=' +
   ips.map(encodeURIComponent).join(',')
 const MM_ONE = ip => 'https://www.maxmind.com/en/geoip-web-services-demo/' + encodeURIComponent(ip)
+const API_BATCH = 'http://ip-api.com/batch?fields=status,mobile,proxy,hosting,isp,org,as,query'
 const ALLOW = /^https:\/\/(?:www\.)?(?:maxmind\.com|scamalytics\.com|ip2location\.com)\//
 const IPAPI_IS = (ip, key) => `https://api.ipapi.is/?q=${encodeURIComponent(ip)}&key=${encodeURIComponent(key)}`
+
+// MaxMind-এর জন্য আলাদা আলাদা egress — কোটা ছড়িয়ে যায়
+const MM_RELAYS = [
+  u => 'https://r.jina.ai/' + u,
+  u => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(u),
+  u => 'https://api.codetabs.com/v1/proxy/?quest=' + encodeURIComponent(u),
+  u => 'https://corsproxy.io/?url=' + encodeURIComponent(u),
+  u => 'https://api.cors.lol/?url=' + encodeURIComponent(u),
+  u => 'https://test.cors.workers.dev/?' + u,
+  u => 'https://cors.isomorphic-git.org/' + u
+]
+let RRI = 0
 
 const ECHO_HTTP = ['http://api.ipify.org/?format=json', 'http://checkip.amazonaws.com/',
   'http://icanhazip.com/', 'http://ip-api.com/json/?fields=query', 'http://ifconfig.me/ip']
@@ -45,11 +58,12 @@ const CTX_TTL = 3 * 60 * 1000
 const RES_TTL = 15 * 60 * 1000
 const MEM = new Map()
 function memGet(k, ttl) { const h = MEM.get(k); return h && Date.now() - h.t < ttl ? h.v : undefined }
-function memSet(k, v) { if (MEM.size > 8000) MEM.clear(); MEM.set(k, { t: Date.now(), v }) }
+function memSet(k, v) { if (MEM.size > 12000) MEM.clear(); MEM.set(k, { t: Date.now(), v }) }
 const inflight = new Map()
 
 const CT_RE = /"connection_type"\s*:\s*"([^"]+)"/i
 const CT_ANY = /(Cable\/DSL|Cellular|Corporate|Satellite)/i
+const CT_HIT = /connection_type|Connection Type/i
 
 const FIELDS = ['proxy', 'scheme', 'ip', 'verdict', 'reasons', 'src', 'sl_src', 'i2l_src', 'ct_src',
                 'sl_vpn', 'sl_rproxy', 'sl_dc', 'i2l_anon', 'i2l_fraud', 'i2l_seen', 'api_flags',
@@ -355,10 +369,9 @@ const stripTags = s => String(s || '').replace(TAG, ' ')
   .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&#39;/g, "'")
   .replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
 
-// লেবেল → ঠিক পরের <td> সেল (কমেন্ট/সাবটাইটেল এড়াতে ট্যাগ-ফর্ম ধরে)
 function cellOf(html, label, wrap) {
   const open = wrap === 'th' ? '<th>' + label + '</th>' : '<strong>' + label + '</strong>'
-  let i = html.indexOf(open)
+  const i = html.indexOf(open)
   if (i === -1) return null
   const from = i + open.length
   const td = html.indexOf('<td', from)
@@ -368,11 +381,9 @@ function cellOf(html, label, wrap) {
   return stripTags(html.slice(td, close)).replace(/\s+/g, ' ').trim()
 }
 
-// ফলব্যাক: সব occurrence লুপ, উইন্ডো চওড়া
 function nearVal(html, label, re) {
-  const lc = html.indexOf(label)
-  if (lc === -1) return ''
-  let i = lc
+  let i = html.indexOf(label)
+  if (i === -1) return ''
   while (i !== -1) {
     const seg = stripTags(html.slice(i + label.length, i + label.length + 400)).replace(/\s+/g, ' ')
     const m = seg.match(re)
@@ -384,8 +395,7 @@ function nearVal(html, label, re) {
 
 const YN = /\b(Yes|No|N\/A|True|False)\b/i
 const pick = (cell, re, fb) => {
-  const c = cell || ''
-  const m = c.match(re)
+  const m = String(cell || '').match(re)
   return m ? m[1].toUpperCase() : fb
 }
 
@@ -400,14 +410,14 @@ function parseSl(t) {
 }
 
 function seenOf(t) {
-  const c = cellOf(t, 'Last Seen', 'strong') || ''
-  const s = c.replace(/^[\s|:*#-]+/, '').trim()
-  const m = s.match(new RegExp(String.raw`^(?:-|\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago|\d{4}-\d{2}-\d{2})`, 'i'))
+  const re = new RegExp(String.raw`^(?:-|\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago|\d{4}-\d{2}-\d{2})`, 'i')
+  const c = (cellOf(t, 'Last Seen', 'strong') || '').replace(/^[\s|:*#-]+/, '').trim()
+  const m = c.match(re)
   if (m) return m[0]
   const i = t.indexOf('Last Seen')
   if (i === -1) return ''
   const seg = stripTags(t.slice(i + 9, i + 300)).replace(/\s+/g, ' ').replace(/^[\s|:*#-]+/, '').trim()
-  const m2 = seg.match(new RegExp(String.raw`^(?:-|\d+\s*(?:second|minute|hour|day|week|month|year)s?\s*ago|\d{4}-\d{2}-\d{2})`, 'i'))
+  const m2 = seg.match(re)
   return m2 ? m2[0] : ''
 }
 
@@ -468,7 +478,7 @@ function i2lVerdict(p) {
   return ['PASS', `anon=No fraud=${fv} seen='${seen || '-'}'`]
 }
 
-// ---------- MaxMind (একমাত্র CT সোর্স, ২৫ IP ব্যাচ) ----------
+// ---------- MaxMind (একমাত্র CT সোর্স) ----------
 function normCt(v) {
   const s = String(v || '').trim().toLowerCase()
   if (s.includes('cable') || s.includes('dsl')) return 'Cable/DSL'
@@ -482,7 +492,6 @@ function normCt(v) {
 const js = (s, k) => { const m = String(s || '').match(new RegExp('"' + k + '"\\s*:\\s*"([^"]*)"', 'i')); return m ? m[1] : '' }
 const jn = (s, k) => { const m = String(s || '').match(new RegExp('"' + k + '"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)', 'i')); return m ? m[1] : '' }
 
-// একই রো-এর সেল (HTML <tr> বা markdown | |)
 function rowCells(t, ip) {
   let i = t.indexOf('geoip-web-services-demo/' + ip)
   if (i === -1) i = t.indexOf('>' + ip + '<')
@@ -544,7 +553,6 @@ function parseMm(t, ip) {
   return (o.ct || o.asn || o.isp) ? o : null
 }
 
-// স্থায়ী ক্যাশ
 async function cdnRead(ip) {
   try {
     const r = await caches.default.match('https://mm-cache.internal/' + ip)
@@ -558,15 +566,32 @@ function cdnWrite(ip, v) {
   } catch {}
 }
 
-// ব্যাচ কিউ
+// রিলে রোটেশন + ডাইরেক্ট
+async function fetchMm(url, ip) {
+  const order = []
+  for (let k = 0; k < 2; k++) order.push(MM_RELAYS[(RRI + k) % MM_RELAYS.length])
+  RRI = (RRI + 2) % MM_RELAYS.length
+
+  for (const f of order) {
+    const t = await requestText(f(url), { timeout: 8000, minLen: 400, needIp: ip })
+    if (t && CT_HIT.test(t)) return t
+  }
+  for (let i = 0; i < 2; i++) {
+    const t = await requestText(url, { timeout: 6000, minLen: 800, needIp: ip, headers: MM_HDR() })
+    if (t && CT_HIT.test(t) && !t.slice(0, 3000).toLowerCase().includes('just a moment')) return t
+    await sleep(150 * (i + 1))
+  }
+  return null
+}
+
 let BATCH = []
 let BTIMER = null
 
 function mmEnqueue(ip) {
   return new Promise(res => {
     BATCH.push({ ip, res })
-    if (BATCH.length >= BATCH_MAX) flushBatch()
-    else if (!BTIMER) BTIMER = setTimeout(flushBatch, BATCH_WAIT)
+    if (BATCH.length >= MM_BATCH_MAX) flushBatch()
+    else if (!BTIMER) BTIMER = setTimeout(flushBatch, MM_BATCH_WAIT)
   })
 }
 
@@ -576,9 +601,7 @@ async function flushBatch() {
   BATCH = []
   if (!jobs.length) return
   const ips = jobs.map(j => j.ip)
-  const url = MM_BULK(ips)
-  let text = await page(url, ips[0])
-  if (!text) text = await viaRelay(url, ips[0])
+  const text = await fetchMm(MM_BULK(ips), ips[0])
   if (!text) {
     for (const j of jobs) { memSet('mmx:' + j.ip, 1); j.res(null) }
     return
@@ -594,27 +617,97 @@ async function mmInfo(ip) {
   const hit = memGet('mm:' + ip, CT_TTL)
   if (hit) return hit
   if (memGet('mmx:' + ip, CTX_TTL)) return null
-  if (inflight.has(ip)) return inflight.get(ip)
-
+  if (inflight.has('mm:' + ip)) return inflight.get('mm:' + ip)
   const pr = (async () => {
     const c = await cdnRead(ip)
     if (c && c.ct) { memSet('mm:' + ip, c); return c }
     const v = await mmEnqueue(ip)
-    if (!v) {
-      const one = await page(MM_ONE(ip), ip)
-      const s = one ? parseMm(one, ip) : null
-      if (s && s.ct) { memSet('mm:' + ip, s); cdnWrite(ip, s); return s }
-    }
-    return v
+    if (v && v.ct) return v
+    const t = await fetchMm(MM_ONE(ip), ip)
+    const s = t ? parseMm(t, ip) : null
+    if (s && s.ct) { memSet('mm:' + ip, s); cdnWrite(ip, s); return s }
+    return v || null
   })()
-
-  inflight.set(ip, pr)
-  try { return await pr } finally { inflight.delete(ip) }
+  inflight.set('mm:' + ip, pr)
+  try { return await pr } finally { inflight.delete('mm:' + ip) }
 }
 
-// ---------- ঐচ্ছিক: ipapi.is (শুধু ভের্ডিক্ট ফ্ল্যাগ) ----------
+// ---------- ip-api.com — শুধু ভের্ডিক্ট ফ্ল্যাগের জন্য ----------
+const API_BATCH = 'http://ip-api.com/batch?fields=status,mobile,proxy,hosting,isp,org,as,query'
+const API_BATCH_MAX = 100
+const API_BATCH_WAIT = 700
+const API_GAP = 4200
+
+let APIB = []
+let APIT = null
+let APILAST = 0
+let APICHAIN = Promise.resolve()
+
+function apiEnqueue(ip) {
+  return new Promise(res => {
+    APIB.push({ ip, res })
+    if (APIB.length >= API_BATCH_MAX) flushApi()
+    else if (!APIT) APIT = setTimeout(flushApi, API_BATCH_WAIT)
+  })
+}
+
+function flushApi() {
+  if (APIT) { clearTimeout(APIT); APIT = null }
+  const jobs = APIB
+  APIB = []
+  if (!jobs.length) return Promise.resolve()
+  APICHAIN = APICHAIN.then(() => apiDo(jobs)).catch(() => {})
+  return APICHAIN
+}
+
+async function apiDo(jobs) {
+  const gap = API_GAP - (Date.now() - APILAST)
+  if (gap > 0) await sleep(gap)
+  APILAST = Date.now()
+  const ips = jobs.map(j => j.ip)
+  let arr = null
+  for (let k = 0; k < 3 && !arr; k++) {
+    const r = await apiPost(ips)
+    if (r === '429') { await sleep(5000 * (k + 1)); continue }
+    arr = r
+  }
+  const map = new Map()
+  if (Array.isArray(arr)) for (const o of arr) if (o && o.query) map.set(o.query, o)
+  for (const j of jobs) {
+    const o = map.get(j.ip)
+    if (o && o.status === 'success') { memSet('ia:' + j.ip, o); j.res(o) } else j.res(null)
+  }
+}
+
+async function apiPost(ips) {
+  const ctl = new AbortController()
+  const t = setTimeout(() => ctl.abort(), 9000)
+  try {
+    const r = await fetch(API_BATCH, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(ips),
+      signal: ctl.signal
+    })
+    if (r.status === 429) return '429'
+    if (!r.ok) return null
+    const j = await r.json()
+    return Array.isArray(j) ? j : null
+  } catch { return null } finally { clearTimeout(t) }
+}
+
+async function apiInfo(ip) {
+  const c = memGet('ia:' + ip, CT_TTL)
+  if (c !== undefined) return c
+  if (inflight.has('ia:' + ip)) return inflight.get('ia:' + ip)
+  const pr = apiEnqueue(ip)
+  inflight.set('ia:' + ip, pr)
+  try { return await pr } finally { inflight.delete('ia:' + ip) }
+}
+
+// ---------- ঐচ্ছিক: ipapi.is (শুধু ফ্ল্যাগ) ----------
 async function ipapiIs(ip, key) {
-  const c = memGet('api:' + ip, CT_TTL)
+  const c = memGet('ii:' + ip, CT_TTL)
   if (c !== undefined) return c
   const t = await requestText(IPAPI_IS(ip, key), { timeout: 4500, headers: JSON_HDR })
   let v = null
@@ -628,8 +721,49 @@ async function ipapiIs(ip, key) {
       }
     } catch {}
   }
-  if (v) memSet('api:' + ip, v)
+  if (v) memSet('ii:' + ip, v)
   return v
+}
+
+// ---------- টাইপ নির্ণয় (শুধু MaxMind) ----------
+async function connType(ip, key) {
+  const cached = memGet('ct:' + ip, CT_TTL)
+  if (cached) return cached
+  if (inflight.has('ct:' + ip)) return inflight.get('ct:' + ip)
+
+  const pr = (async () => {
+    const r = { ct: '', src: '', api: null, asn: '', asnorg: '', isp: '', org: '', lat: '', lon: '', net: '' }
+    const [mm, o, a] = await Promise.all([
+      mmInfo(ip),
+      apiInfo(ip),
+      key ? ipapiIs(ip, key) : Promise.resolve(null)
+    ])
+
+    if (mm) {
+      r.ct = mm.ct || ''
+      if (r.ct) r.src = 'maxmind'
+      r.asn = mm.asn || ''; r.asnorg = mm.asnorg || ''
+      r.isp = mm.isp || ''; r.org = mm.org || ''
+      r.lat = mm.lat || ''; r.lon = mm.lon || ''; r.net = mm.net || ''
+    }
+
+    if (o) {
+      const as = String(o.as || '')
+      r.asn = r.asn || (as.match(/^AS\d+/) || [''])[0]
+      r.asnorg = r.asnorg || as.replace(/^AS\d+\s*/, '')
+      r.isp = r.isp || o.isp || ''
+      r.org = r.org || o.org || ''
+      r.api = { is_proxy: !!o.proxy, is_datacenter: !!o.hosting, is_mobile: !!o.mobile,
+                is_vpn: false, is_tor: false, is_abuser: false }
+    }
+    if (a) r.api = { ...(r.api || {}), ...a }
+
+    memSet('ct:' + ip, r)
+    return r
+  })()
+
+  inflight.set('ct:' + ip, pr)
+  try { return await pr } finally { inflight.delete('ct:' + ip) }
 }
 
 function apiVerdict(a) {
@@ -640,8 +774,8 @@ function apiVerdict(a) {
   if (a.is_proxy) bad.push('proxy')
   if (a.is_datacenter) bad.push('dc')
   if (a.is_abuser) bad.push('abuser')
-  if (bad.length) return ['FAIL', 'ipapi.is: ' + bad.join(',')]
-  return ['PASS', 'ipapi.is: clean']
+  if (bad.length) return ['FAIL', 'flags: ' + bad.join(',')]
+  return ['PASS', 'flags: clean']
 }
 
 // ---------- ধাপ ----------
@@ -767,10 +901,10 @@ async function run(request) {
     if (hit) return json({ ...hit, proxy: rec.proxy, secs: +((Date.now() - t0) / 1000).toFixed(1) })
 
     const wait = budget * 1000
-    const [slR, i2lR, mm] = await Promise.all([
+    const [slR, i2lR, ct] = await Promise.all([
       timed(getSl(rec.ip, worker), wait),
       timed(getI2l(rec.ip, worker), wait),
-      timed(mmInfo(rec.ip), wait)
+      timed(connType(rec.ip, key), Math.max(wait, 25000))
     ])
 
     const [sl, ssrc] = slR || [null, 'none']
@@ -785,29 +919,28 @@ async function run(request) {
     let extra = ''
     if (vs === 'FAIL' || vi === 'FAIL') verdict = 'FAIL'
     else if (vs === 'PASS' && vi === 'PASS') verdict = 'PASS'
+    else {
+      const av = apiVerdict(ct && ct.api)
+      if (av) { verdict = av[0]; extra = ' | ' + av[1] }
+    }
 
-    rec.mm_ct = (mm && mm.ct) || ''
-    rec.ct_src = rec.mm_ct ? 'maxmind' : ''
-    rec.mm_asn = (mm && mm.asn) || ''
-    rec.mm_asnorg = (mm && mm.asnorg) || ''
-    rec.mm_isp = (mm && mm.isp) || ''
-    rec.mm_org = (mm && mm.org) || ''
-    rec.mm_lat = (mm && mm.lat) || ''
-    rec.mm_lon = (mm && mm.lon) || ''
-    rec.mm_net = (mm && mm.net) || ''
+    rec.mm_ct = (ct && ct.ct) || ''
+    rec.ct_src = (ct && ct.src) || ''
+    rec.mm_asn = (ct && ct.asn) || ''
+    rec.mm_asnorg = (ct && ct.asnorg) || ''
+    rec.mm_isp = (ct && ct.isp) || ''
+    rec.mm_org = (ct && ct.org) || ''
+    rec.mm_lat = (ct && ct.lat) || ''
+    rec.mm_lon = (ct && ct.lon) || ''
+    rec.mm_net = (ct && ct.net) || ''
+    const a = ct && ct.api
+    rec.api_flags = a ? `vpn:${+!!a.is_vpn} dc:${+!!a.is_datacenter} proxy:${+!!a.is_proxy} tor:${+!!a.is_tor} mobile:${+!!a.is_mobile} abuser:${+!!a.is_abuser}` : ''
     rec.sl_vpn = (sl && sl.vpn) || ''
     rec.sl_rproxy = (sl && sl.rproxy) || ''
     rec.sl_dc = (sl && sl.dc) || ''
     rec.i2l_anon = (i2l && i2l.anon) || ''
     rec.i2l_fraud = (i2l && i2l.fraud) || ''
     rec.i2l_seen = (i2l && i2l.seen) || ''
-
-    if (verdict === 'UNKNOWN' && key && (!sl || !i2l)) {
-      const a = await timed(ipapiIs(rec.ip, key), 5000)
-      const av = apiVerdict(a)
-      if (av) { verdict = av[0]; extra = ' | ' + av[1] }
-      rec.api_flags = a ? `vpn:${+a.is_vpn} dc:${+a.is_datacenter} proxy:${+a.is_proxy} tor:${+a.is_tor} mobile:${+a.is_mobile} abuser:${+a.is_abuser}` : ''
-    }
 
     rec.verdict = verdict
     rec.reasons = `scam: ${rs} | ip2loc: ${ri}${extra}`
@@ -884,7 +1017,7 @@ export default {
       const sp = new URL(request.url).searchParams
       if (sp.has('probe')) return probe(request)
       const node = typeof process !== 'undefined' ? process.version : 'n/a'
-      return json(sp.has('health') ? { ok: true, node, ct: 'maxmind-batch', rt: 'sockets' } : { ok: true })
+      return json(sp.has('health') ? { ok: true, node, ct: 'maxmind-only(relay-rotated)', rt: 'sockets' } : { ok: true })
     }
     if (pathname === '/api/page') return pageProxy(request)
     if (pathname === '/api/probe') return probe(request)
