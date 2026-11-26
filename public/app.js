@@ -192,7 +192,7 @@ function resCount() {
 
 async function checkOne(p) {
   const worker = $('#worker').value.trim()
-  const timeout = Math.min(Math.max(Number($('#timeout').value) || 8, 4), 12)
+  const timeout = Math.min(Math.max(Number($('#timeout').value) || 8, 4), 20)
   const t = Date.now()
 
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -307,6 +307,7 @@ function download(name, text, type = 'text/plain') {
 const all = () => [...results.values()]
 const passRows = () => all().filter(r => r.verdict === 'PASS')
 const resRows = v => all().filter(r => U(r.sl_rproxy) === v)
+const ctRows = v => all().filter(r => r.mm_ct === v)
 const csvCell = v => `"${String(v ?? '').replace(/"/g, '""')}"`
 const FIELDS = ['proxy', 'scheme', 'ip', 'verdict', 'reasons', 'src', 'sl_vpn', 'sl_rproxy', 'sl_dc',
                 'i2l_anon', 'i2l_fraud', 'i2l_seen', 'mm_ct', 'mm_asn', 'mm_asnorg', 'mm_org', 'secs']
@@ -316,11 +317,17 @@ $('#dl-csv').addEventListener('click', () => download('all.csv',
 
 $('#dl-good').addEventListener('click', () => download('good.txt', passRows().map(r => r.proxy).join('\n')))
 
-$('#dl-cable').addEventListener('click', () => download('good_cable_dsl.txt',
-  passRows().filter(r => r.mm_ct === 'Cable/DSL').map(r => r.proxy).join('\n')))
+$('#dl-cable').addEventListener('click', () => {
+  const rows = ctRows('Cable/DSL')
+  if (!rows.length) { alert('Cable/DSL টাইপের কোনো প্রক্সি নেই।'); return }
+  download('cable_dsl.txt', rows.map(r => r.proxy).join('\n'))
+})
 
-$('#dl-cell').addEventListener('click', () => download('good_cellular.txt',
-  passRows().filter(r => r.mm_ct === 'Cellular').map(r => r.proxy).join('\n')))
+$('#dl-cell').addEventListener('click', () => {
+  const rows = ctRows('Cellular')
+  if (!rows.length) { alert('Cellular টাইপের কোনো প্রক্সি নেই।'); return }
+  download('cellular.txt', rows.map(r => r.proxy).join('\n'))
+})
 
 $('#dl-resyes').addEventListener('click', () => download('res_yes.txt', resRows('YES').map(r => r.proxy).join('\n')))
 $('#dl-resno').addEventListener('click', () => download('res_no.txt', resRows('NO').map(r => r.proxy).join('\n')))
