@@ -10,12 +10,14 @@ let counts = { PASS: 0, FAIL: 0, UNKNOWN: 0, DEAD: 0, ERROR: 0 }
 let penalty = 0, n429 = 0, t0 = 0
 let lastRender = 0, renderQueued = false
 let filter = null
+let showFail = false
 const copied = new Set()
 
 const rnd = (a, b) => a + Math.random() * (b - a)
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
-const LABEL = { PASS: 'PASS', FAIL: 'FAIL', inc: 'অসম্পূর্ণ' }
+const LABEL = { PASS: 'PASS', FAIL: 'FAIL', UNKNOWN: 'UNK', DEAD: 'DEAD', ERROR: 'ERR',
+  'res-yes': 'ResProxy YES', 'res-no': 'ResProxy NO', cable: 'Cable/DSL', cell: 'Cellular', inc: 'অসম্পূর্ণ' }
 
 const MATCH = {
   PASS: r => U(r.verdict) === 'PASS',
@@ -31,6 +33,7 @@ const MATCH = {
 }
 
 const isInc = r => !!r.ip && (!r.mm_ct || U(r.verdict) === 'UNKNOWN')
+const isFail = r => U(r.verdict) === 'FAIL'
 
 function parseProxy(line) {
   const raw = String(line || '').trim()
@@ -183,7 +186,8 @@ function card(r) {
 
 const all = () => [...results.values()]
 const visible = () => {
-  const rows = all().reverse()
+  let rows = all().reverse()
+  if (!showFail) rows = rows.filter(r => !isFail(r))
   return filter ? rows.filter(MATCH[filter]) : rows
 }
 
@@ -205,18 +209,34 @@ function render() {
   if (filter) $('#f-count').textContent = `মোট ${rows.length} টি`
 }
 
-function setFilter(f) {
-  filter = (filter === f) ? null : f
-  for (const b of document.querySelectorAll('.st')) b.classList.toggle('on', b.dataset.f === filter)
+function syncChips() {
+  for (const b of document.querySelectorAll('.st')) {
+    const f = b.dataset.f
+    b.classList.toggle('on', f === 'FAIL' ? showFail : f === filter)
+  }
   const bar = $('#fbar')
   bar.classList.toggle('on', !!filter)
   if (filter) $('#f-label').textContent = LABEL[filter]
+}
+
+function setFilter(f) {
+  if (f === 'FAIL') {
+    showFail = !showFail
+    filter = showFail ? 'FAIL' : (filter === 'FAIL' ? null : filter)
+  } else {
+    filter = (filter === f) ? null : f
+  }
+  syncChips()
   render()
   if (filter) list.scrollIntoView({ behavior: 'smooth', block: 'start' })
 }
 
 for (const b of document.querySelectorAll('.st')) b.addEventListener('click', () => setFilter(b.dataset.f))
-$('#f-all').addEventListener('click', () => { if (filter) setFilter(filter) })
+$('#f-all').addEventListener('click', () => {
+  filter = null
+  syncChips()
+  render()
+})
 
 async function copyText(t) {
   try {
@@ -254,11 +274,24 @@ list.addEventListener('click', async e => {
 
 function stats() {
   const el = Math.max((Date.now() - t0) / 1000, 0.001)
-  let inc = 0
-  for (const r of results.values()) if (isInc(r)) inc++
+  let resy = 0, resn = 0, cable = 0, cell = 0, inc = 0
+  for (const r of results.values()) {
+    if (isYes(r.sl_rproxy)) resy++
+    else if (U(r.sl_rproxy) === 'NO') resn++
+    if (r.mm_ct === 'Cable/DSL') cable++
+    else if (r.mm_ct === 'Cellular') cell++
+    if (isInc(r)) inc++
+  }
   $('#s-done').textContent = `${done}/${queue.length}`
   $('#s-pass').textContent = counts.PASS
   $('#s-fail').textContent = counts.FAIL
+  $('#s-unk').textContent = counts.UNKNOWN
+  $('#s-dead').textContent = counts.DEAD
+  $('#s-err').textContent = counts.ERROR
+  $('#s-resy').textContent = resy
+  $('#s-resn').textContent = resn
+  $('#s-cable').textContent = cable
+  $('#s-cell').textContent = cell
   $('#s-inc').textContent = inc
   $('#s-copied').textContent = copied.size
   $('#s-rate').textContent = Math.round(done / el * 60)
@@ -401,7 +434,8 @@ $('#clear').addEventListener('click', () => {
   results = new Map(); queue = []; done = 0
   counts = { PASS: 0, FAIL: 0, UNKNOWN: 0, DEAD: 0, ERROR: 0 }
   copied.clear()
-  if (filter) setFilter(filter)
+  filter = null; showFail = false
+  syncChips()
   resCount()
   stats()
 })
