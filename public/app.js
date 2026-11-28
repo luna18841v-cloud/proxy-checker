@@ -1,5 +1,5 @@
 const FN = '/api/check'
-const HARD_MS = 45000
+const HARD_MS = 60000
 const KEY_LS = 'pc_key'
 
 const $ = s => document.querySelector(s)
@@ -9,9 +9,25 @@ let queue = [], results = new Map(), running = false, next = 0, done = 0
 let counts = { PASS: 0, FAIL: 0, UNKNOWN: 0, DEAD: 0, ERROR: 0 }
 let penalty = 0, n429 = 0, t0 = 0
 let lastRender = 0, renderQueued = false
+let filter = null
 
 const rnd = (a, b) => a + Math.random() * (b - a)
 const sleep = ms => new Promise(r => setTimeout(r, ms))
+
+const LABEL = { PASS: 'PASS', FAIL: 'FAIL', UNKNOWN: 'UNK', DEAD: 'DEAD', ERROR: 'ERR',
+  'res-yes': 'ResProxy YES', 'res-no': 'ResProxy NO', cable: 'Cable/DSL', cell: 'Cellular' }
+
+const MATCH = {
+  PASS: r => U(r.verdict) === 'PASS',
+  FAIL: r => U(r.verdict) === 'FAIL',
+  UNKNOWN: r => U(r.verdict) === 'UNKNOWN',
+  DEAD: r => U(r.verdict) === 'DEAD',
+  ERROR: r => U(r.verdict) === 'ERROR',
+  'res-yes': r => U(r.sl_rproxy) === 'YES',
+  'res-no': r => U(r.sl_rproxy) === 'NO',
+  cable: r => r.mm_ct === 'Cable/DSL',
+  cell: r => r.mm_ct === 'Cellular'
+}
 
 function parseProxy(line) {
   const raw = String(line || '').trim()
@@ -46,8 +62,8 @@ $('#file').addEventListener('change', async e => {
 $('#key').value = localStorage.getItem(KEY_LS) || ''
 $('#key').addEventListener('change', () => localStorage.setItem(KEY_LS, $('#key').value.trim()))
 
-const esc = s => String(s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
-const U = v => String(v || '').trim().toUpperCase()
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]))
+const U = v => String(v ?? '').trim().toUpperCase()
 
 function norm(v) {
   if (v === true) return 'YES'
@@ -105,24 +121,35 @@ function sharedOf(r) {
 
 const srcBadge = s => `<span class="src ${!s || s === 'none' ? 'b' : ''}">${esc(s || 'none')}</span>`
 
+const STAGES = { exit: 'exit', pages: 'pages', done: 'done', parse: 'parse', client: 'client', http: 'http' }
+
 function card(r) {
   const v = U(r.verdict) || 'UNKNOWN'
   const vcls = v === 'PASS' ? 'pass' : v === 'FAIL' ? 'fail' : v === 'UNKNOWN' ? 'unk' : 'dead'
-  const it = ipTypeOf(r)
-  const native = it === 'Residential' || it === 'Cellular' ? 'Native IP' : 'Non-Native IP'
-  const n = riskOf(r)
-  const band = BANDS.find(x => n < x[0]) || BANDS[4]
-  const ipLink = r.ip ? `<a class="lnk" href="https://ping0.cc/ip/${esc(r.ip)}" target="_blank" rel="noopener">${esc(r.ip)}</a>` : '—'
 
-  return `<div class="item">
-    <div class="ihead">
+  const head = `<div class="ihead">
       <span class="pv">${esc(r.proxy)}</span>
       <span class="vd ${vcls}">${esc(v)}</span>
       ${r.ip ? `<span class="pip">${esc(r.ip)}</span>` : ''}
       <span class="srcb">sl ${srcBadge(r.sl_src)}</span>
       <span class="srcb">i2l ${srcBadge(r.i2l_src)}</span>
+      ${r.stage ? `<span class="stg">${esc(STAGES[r.stage] || r.stage)}</span>` : ''}
       <span class="secs">${esc(r.secs)}s</span>
-    </div>
+    </div>`
+
+  if (!r.ip) {
+    return `<div class="item">${head}
+      <div class="idet">${kv('Reasons', esc(r.reasons || '—'))}</div>
+    </div>`
+  }
+
+  const it = ipTypeOf(r)
+  const native = it === 'Residential' || it === 'Cellular' ? 'Native IP' : 'Non-Native IP'
+  const n = riskOf(r)
+  const band = BANDS.find(x => n < x[0]) || BANDS[4]
+  const ipLink = `<a class="lnk" href="https://ping0.cc/ip/${esc(r.ip)}" target="_blank" rel="noopener">${esc(r.ip)}</a>`
+
+  return `<div class="item">${head}
     <div class="idet">
       ${kv('IP', ipLink)}
       ${kv('Anonymizing VPN', val(r.sl_vpn))}
@@ -149,6 +176,12 @@ function card(r) {
   </div>`
 }
 
+const all = () => [...results.values()]
+const visible = () => {
+  const rows = all().reverse()
+  return filter ? rows.filter(MATCH[filter]) : rows
+}
+
 function render() {
   const now = Date.now()
   if (now - lastRender < 250) {
@@ -156,10 +189,29 @@ function render() {
     return
   }
   lastRender = now
-  const rows = [...results.values()].reverse()
+  const rows = visible()
   $('#empty').style.display = rows.length ? 'none' : ''
+  if (!rows.length) {
+    $('#empty').innerHTML = filter
+      ? `এই ফিল্টারে (<b>${esc(LABEL[filter])}</b>) এখনো কিছু নেই।`
+      : 'লিস্ট বসিয়ে <b>শুরু</b> চাপুন — ফলাফল এখানে আসবে।'
+  }
   list.innerHTML = rows.map(card).join('')
+  if (filter) $('#f-count').textContent = `মোট ${rows.length} টি`
 }
+
+function setFilter(f) {
+  filter = (filter === f) ? null : f
+  for (const b of document.querySelectorAll('.st')) b.classList.toggle('on', b.dataset.f === filter)
+  const bar = $('#fbar')
+  bar.classList.toggle('on', !!filter)
+  if (filter) $('#f-label').textContent = LABEL[filter]
+  render()
+  if (filter) list.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
+for (const b of document.querySelectorAll('.st')) b.addEventListener('click', () => setFilter(b.dataset.f))
+$('#f-all').addEventListener('click', () => { if (filter) setFilter(filter) })
 
 function stats() {
   const el = Math.max((Date.now() - t0) / 1000, 0.001)
@@ -199,10 +251,17 @@ function resCount() {
   el.textContent = `নির্বাচিত: ${n} টি`
 }
 
+const errRec = (p, reason, ms, stage) => ({
+  proxy: p.raw, scheme: '', ip: '', verdict: 'ERROR', reasons: reason, stage: stage || '',
+  src: '', sl_src: 'none', i2l_src: 'none', ct_src: '',
+  secs: +((Date.now() - ms) / 1000).toFixed(1),
+  sl_vpn: '', sl_rproxy: '', sl_dc: '', i2l_anon: ''
+})
+
 async function checkOne(p) {
   const worker = $('#worker').value.trim()
   const key = $('#key').value.trim()
-  const timeout = Math.min(Math.max(Number($('#timeout').value) || 8, 4), 20)
+  const timeout = Math.min(Math.max(Number($('#timeout').value) || 12, 4), 25)
   const t = Date.now()
 
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -221,10 +280,7 @@ async function checkOne(p) {
       let j = null
       try { j = JSON.parse(raw) } catch {}
       if (!j) {
-        return { proxy: p.raw, scheme: '', ip: '', verdict: 'ERROR',
-                 reasons: `http ${res.status} ${raw.slice(0, 80).replace(/\s+/g, ' ')}`,
-                 src: '', sl_src: 'none', i2l_src: 'none', ct_src: '',
-                 secs: 0, sl_vpn: '', sl_rproxy: '', sl_dc: '', i2l_anon: '' }
+        return errRec(p, `http ${res.status} ${raw.slice(0, 80).replace(/\s+/g, ' ')}`, t, 'http')
       }
       if (res.status === 429 || res.status >= 500) {
         n429++
@@ -244,10 +300,12 @@ async function checkOne(p) {
       }
     } catch (e) {
       clearTimeout(timer)
+      if (e.name === 'AbortError') {
+        if (attempt < 1) { await sleep(300); continue }
+        return errRec(p, `timeout ${Math.round(HARD_MS / 1000)}s`, t, 'client')
+      }
       if (attempt < 2) { await sleep(500 * (attempt + 1)); continue }
-      return { proxy: p.raw, scheme: '', ip: '', verdict: 'ERROR', reasons: e.name,
-               src: '', sl_src: 'none', i2l_src: 'none', ct_src: '',
-               secs: 0, sl_vpn: '', sl_rproxy: '', sl_dc: '', i2l_anon: '' }
+      return errRec(p, e.name, t, 'client')
     }
   }
 }
@@ -297,6 +355,7 @@ $('#clear').addEventListener('click', () => {
   list.innerHTML = ''
   results = new Map(); queue = []; done = 0
   counts = { PASS: 0, FAIL: 0, UNKNOWN: 0, DEAD: 0, ERROR: 0 }
+  if (filter) setFilter(filter)
   resCount()
   stats()
 })
@@ -316,12 +375,11 @@ function download(name, text, type = 'text/plain') {
   setTimeout(() => URL.revokeObjectURL(a.href), 4000)
 }
 
-const all = () => [...results.values()]
 const passRows = () => all().filter(r => r.verdict === 'PASS')
 const resRows = v => all().filter(r => U(r.sl_rproxy) === v)
 const ctRows = v => all().filter(r => r.mm_ct === v)
 const csvCell = v => `"${String(v ?? '').replace(/"/g, '""')}"`
-const FIELDS = ['proxy', 'scheme', 'ip', 'verdict', 'reasons', 'src', 'sl_src', 'i2l_src', 'ct_src',
+const FIELDS = ['proxy', 'scheme', 'ip', 'verdict', 'reasons', 'stage', 'src', 'sl_src', 'i2l_src', 'ct_src',
                 'sl_vpn', 'sl_rproxy', 'sl_dc', 'i2l_anon', 'i2l_fraud', 'i2l_seen', 'api_flags',
                 'mm_ct', 'mm_asn', 'mm_asnorg', 'mm_isp', 'mm_org', 'mm_lat', 'mm_lon', 'mm_net', 'secs']
 
