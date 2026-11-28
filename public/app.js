@@ -10,12 +10,12 @@ let counts = { PASS: 0, FAIL: 0, UNKNOWN: 0, DEAD: 0, ERROR: 0 }
 let penalty = 0, n429 = 0, t0 = 0
 let lastRender = 0, renderQueued = false
 let filter = null
+const copied = new Set()
 
 const rnd = (a, b) => a + Math.random() * (b - a)
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
-const LABEL = { PASS: 'PASS', FAIL: 'FAIL', UNKNOWN: 'UNK', DEAD: 'DEAD', ERROR: 'ERR',
-  'res-yes': 'ResProxy YES', 'res-no': 'ResProxy NO', cable: 'Cable/DSL', cell: 'Cellular' }
+const LABEL = { PASS: 'PASS', FAIL: 'FAIL', inc: 'অসম্পূর্ণ' }
 
 const MATCH = {
   PASS: r => U(r.verdict) === 'PASS',
@@ -26,8 +26,11 @@ const MATCH = {
   'res-yes': r => U(r.sl_rproxy) === 'YES',
   'res-no': r => U(r.sl_rproxy) === 'NO',
   cable: r => r.mm_ct === 'Cable/DSL',
-  cell: r => r.mm_ct === 'Cellular'
+  cell: r => r.mm_ct === 'Cellular',
+  inc: r => !!r.ip && (!r.mm_ct || U(r.verdict) === 'UNKNOWN')
 }
+
+const isInc = r => !!r.ip && (!r.mm_ct || U(r.verdict) === 'UNKNOWN')
 
 function parseProxy(line) {
   const raw = String(line || '').trim()
@@ -121,11 +124,12 @@ function sharedOf(r) {
 
 const srcBadge = s => `<span class="src ${!s || s === 'none' ? 'b' : ''}">${esc(s || 'none')}</span>`
 
-const STAGES = { exit: 'exit', pages: 'pages', done: 'done', parse: 'parse', client: 'client', http: 'http' }
+const STAGES = { exit: 'exit', pages: 'pages', retry: 'retry', done: 'done', parse: 'parse', client: 'client', http: 'http' }
 
 function card(r) {
   const v = U(r.verdict) || 'UNKNOWN'
   const vcls = v === 'PASS' ? 'pass' : v === 'FAIL' ? 'fail' : v === 'UNKNOWN' ? 'unk' : 'dead'
+  const isCopied = copied.has(r.proxy)
 
   const head = `<div class="ihead">
       <span class="pv">${esc(r.proxy)}</span>
@@ -134,11 +138,12 @@ function card(r) {
       <span class="srcb">sl ${srcBadge(r.sl_src)}</span>
       <span class="srcb">i2l ${srcBadge(r.i2l_src)}</span>
       ${r.stage ? `<span class="stg">${esc(STAGES[r.stage] || r.stage)}</span>` : ''}
+      <button class="cp${isCopied ? ' ok' : ''}" data-p="${esc(r.proxy)}" title="শুধু প্রক্সি কপি">${isCopied ? '✓ কপি হয়েছে' : 'কপি'}</button>
       <span class="secs">${esc(r.secs)}s</span>
     </div>`
 
   if (!r.ip) {
-    return `<div class="item">${head}
+    return `<div class="item${isCopied ? ' copied' : ''}">${head}
       <div class="idet">${kv('Reasons', esc(r.reasons || '—'))}</div>
     </div>`
   }
@@ -149,7 +154,7 @@ function card(r) {
   const band = BANDS.find(x => n < x[0]) || BANDS[4]
   const ipLink = `<a class="lnk" href="https://ping0.cc/ip/${esc(r.ip)}" target="_blank" rel="noopener">${esc(r.ip)}</a>`
 
-  return `<div class="item">${head}
+  return `<div class="item${isCopied ? ' copied' : ''}">${head}
     <div class="idet">
       ${kv('IP', ipLink)}
       ${kv('Anonymizing VPN', val(r.sl_vpn))}
@@ -213,25 +218,49 @@ function setFilter(f) {
 for (const b of document.querySelectorAll('.st')) b.addEventListener('click', () => setFilter(b.dataset.f))
 $('#f-all').addEventListener('click', () => { if (filter) setFilter(filter) })
 
+async function copyText(t) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(t); return true }
+  } catch {}
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = t
+    ta.style.position = 'fixed'
+    ta.style.top = '-1000px'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.focus(); ta.select()
+    const ok = document.execCommand('copy')
+    ta.remove()
+    return ok
+  } catch { return false }
+}
+
+list.addEventListener('click', async e => {
+  const btn = e.target.closest('.cp')
+  if (!btn) return
+  const p = btn.dataset.p
+  const ok = await copyText(p)
+  if (!ok) { alert('কপি করা যায়নি — ব্রাউজার অনুমতি দেয়নি।'); return }
+  copied.add(p)
+  const rec = results.get(p)
+  if (rec) rec.copied = true
+  btn.classList.add('ok')
+  btn.textContent = '✓ কপি হয়েছে'
+  const item = btn.closest('.item')
+  if (item) item.classList.add('copied')
+  stats()
+})
+
 function stats() {
   const el = Math.max((Date.now() - t0) / 1000, 0.001)
-  let resy = 0, resn = 0, cable = 0, cell = 0
-  for (const r of results.values()) {
-    if (isYes(r.sl_rproxy)) resy++
-    else if (U(r.sl_rproxy) === 'NO') resn++
-    if (r.mm_ct === 'Cable/DSL') cable++
-    else if (r.mm_ct === 'Cellular') cell++
-  }
+  let inc = 0
+  for (const r of results.values()) if (isInc(r)) inc++
   $('#s-done').textContent = `${done}/${queue.length}`
   $('#s-pass').textContent = counts.PASS
   $('#s-fail').textContent = counts.FAIL
-  $('#s-unk').textContent = counts.UNKNOWN
-  $('#s-dead').textContent = counts.DEAD
-  $('#s-err').textContent = counts.ERROR
-  $('#s-resy').textContent = resy
-  $('#s-resn').textContent = resn
-  $('#s-cable').textContent = cable
-  $('#s-cell').textContent = cell
+  $('#s-inc').textContent = inc
+  $('#s-copied').textContent = copied.size
   $('#s-rate').textContent = Math.round(done / el * 60)
   $('#s-429').textContent = n429
   $('#s-el').textContent = Math.round(el) + 's'
@@ -315,6 +344,8 @@ async function lane() {
     const i = next++
     if (i >= queue.length) return
     const rec = await checkOne(queue[i])
+    const prev = results.get(rec.proxy)
+    if (prev && prev.verdict) counts[prev.verdict] = Math.max(0, (counts[prev.verdict] || 0) - 1)
     counts[rec.verdict] = (counts[rec.verdict] || 0) + 1
     results.set(rec.proxy, rec)
     done++
@@ -322,18 +353,12 @@ async function lane() {
   }
 }
 
-$('#start').addEventListener('click', async () => {
-  if (running) return
-  const l = readList()
-  if (!l.length) { alert('বৈধ প্রক্সি নেই।'); return }
-
-  queue = l; results = new Map(); next = 0; done = 0
-  counts = { PASS: 0, FAIL: 0, UNKNOWN: 0, DEAD: 0, ERROR: 0 }
+async function startRun(l) {
+  queue = l; next = 0; done = 0
   penalty = 0; n429 = 0; t0 = Date.now(); running = true
-  list.innerHTML = ''
   $('#empty').style.display = 'none'
-
   $('#start').disabled = true
+  $('#recheck').disabled = true
   $('#stop').disabled = false
   stats()
 
@@ -342,8 +367,28 @@ $('#start').addEventListener('click', async () => {
 
   running = false
   $('#start').disabled = false
+  $('#recheck').disabled = false
   $('#stop').disabled = true
   stats()
+}
+
+$('#start').addEventListener('click', () => {
+  if (running) return
+  const l = readList()
+  if (!l.length) { alert('বৈধ প্রক্সি নেই।'); return }
+  results = new Map()
+  counts = { PASS: 0, FAIL: 0, UNKNOWN: 0, DEAD: 0, ERROR: 0 }
+  copied.clear()
+  list.innerHTML = ''
+  startRun(l)
+})
+
+$('#recheck').addEventListener('click', () => {
+  if (running) return
+  const rows = [...results.values()].filter(isInc)
+  if (!rows.length) { alert('রি-চেক করার মতো অসম্পূর্ণ রেকর্ড নেই।'); return }
+  for (const r of rows) results.delete(r.proxy)
+  startRun(rows.map(r => ({ raw: r.proxy })))
 })
 
 $('#stop').addEventListener('click', () => { running = false })
@@ -355,6 +400,7 @@ $('#clear').addEventListener('click', () => {
   list.innerHTML = ''
   results = new Map(); queue = []; done = 0
   counts = { PASS: 0, FAIL: 0, UNKNOWN: 0, DEAD: 0, ERROR: 0 }
+  copied.clear()
   if (filter) setFilter(filter)
   resCount()
   stats()
