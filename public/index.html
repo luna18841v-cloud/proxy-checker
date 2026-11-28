@@ -33,6 +33,8 @@
   .stats .st.on{background:linear-gradient(180deg,#ff5cae,#d92f88);border-color:transparent;color:#fff;box-shadow:0 4px 12px rgba(217,47,136,.35)}
   .stats .st.on b{color:#fff}
   .stats .st b{color:inherit}
+  .stats .st.fail{background:var(--badbg);border-color:#ffb3b3;color:var(--badtx)}
+  .stats .st.fail.on{background:linear-gradient(180deg,#e03131,#b02525);border-color:transparent;color:#fff}
   .hint{font-size:11px;color:var(--dm);margin-top:6px}
   .picks{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px}
   .picks label{display:inline-flex;gap:7px;align-items:center;text-transform:none;font-size:12.5px;color:#a01e63;margin:0;font-weight:800;background:#ffe0ee;border:2px solid #ffb8da;border-radius:999px;padding:8px 16px;cursor:pointer}
@@ -98,7 +100,7 @@
       <button id="test">ফাংশন টেস্ট</button>
       <span class="hint" id="parsed"></span>
     </div>
-    <div class="hint">Cable/DSL ও Cellular শুধুই MaxMind থেকে নেওয়া হয় (পাথ URL + ?ip_address= ভ্যারিয়েন্ট, Worker রিলে, রিলে ফলব্যাক, ১২ ঘণ্টা ক্যাশ)। Worker URL-এ নিজের ডিপ্লয় করা ঠিকানা দিলে ব্লক অনেক কমে। ipapi.is কী শুধু স্ক্র্যাপ ব্লক হলে ভের্ডিক্ট ঠিক করতে ব্যবহৃত হয় — CT-তে হাত দেয় না।</div>
+    <div class="hint">FAIL প্রক্সি লিস্টে দেখানো হয় না — শুধু গোনা হয়। FAIL চিপে ক্লিক করলে ওগুলো দেখা যাবে। Cable/DSL ও Cellular শুধুই MaxMind থেকে নেওয়া হয় (পাথ URL + ?ip_address= ভ্যারিয়েন্ট, Worker রিলে, রিলে ফলব্যাক, ১২ ঘণ্টা ক্যাশ)।</div>
   </div>
 
   <div class="panel">
@@ -106,7 +108,14 @@
     <div class="stats">
       <span>প্রগতি <b id="s-done">0/0</b></span>
       <button class="st" data-f="PASS">PASS <b id="s-pass">0</b></button>
-      <button class="st" data-f="FAIL">FAIL <b id="s-fail">0</b></button>
+      <button class="st fail" data-f="FAIL">FAIL <b id="s-fail">0</b></button>
+      <button class="st" data-f="UNKNOWN">UNK <b id="s-unk">0</b></button>
+      <button class="st" data-f="DEAD">DEAD <b id="s-dead">0</b></button>
+      <button class="st" data-f="ERROR">ERR <b id="s-err">0</b></button>
+      <button class="st" data-f="res-yes">ResProxy YES <b id="s-resy">0</b></button>
+      <button class="st" data-f="res-no">ResProxy NO <b id="s-resn">0</b></button>
+      <button class="st" data-f="cable">Cable/DSL <b id="s-cable">0</b></button>
+      <button class="st" data-f="cell">Cellular <b id="s-cell">0</b></button>
       <button class="st" data-f="inc">অসম্পূর্ণ <b id="s-inc">0</b></button>
       <span>কপি <b id="s-copied">0</b></span>
       <span>গতি <b id="s-rate">0</b>/মিনিট</span>
