@@ -3,14 +3,15 @@ import { connect } from 'cloudflare:sockets'
 
 const FRAUD_MAX = 20
 const SEEN_OK = new Set(['', '-', '0'])
-const ECHO_MIN = 4000
 const CAP = 900_000
 const MM_BATCH_MAX = 25
 const MM_BATCH_WAIT = 1200
 const API_BATCH = 'http://ip-api.com/batch?fields=status,mobile,proxy,hosting,isp,org,as,query'
+const API_ONE = f => `http://ip-api.com/json/${encodeURIComponent(f)}?fields=status,mobile,proxy,hosting,isp,org,as,query`
 const API_BATCH_MAX = 100
 const API_BATCH_WAIT = 700
 const API_GAP = 4200
+const API_SINGLE_MAX = 12
 
 const UAS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -40,8 +41,16 @@ const MM_RELAYS = [
   u => 'https://api.cors.lol/?url=' + encodeURIComponent(u)
 ]
 
+// ASN/org ফলব্যাক — ফ্ল্যাগ নেই, শুধু টাইপ ইনফারের জন্য
+const GEO_FB = [
+  ip => `https://ipwho.is/${encodeURIComponent(ip)}`,
+  ip => `https://freeipapi.com/api/json/${encodeURIComponent(ip)}`,
+  ip => `https://api.iplocation.net/?ip=${encodeURIComponent(ip)}`
+]
+
 const ECHO_HTTP = ['http://api.ipify.org/?format=json', 'http://checkip.amazonaws.com/',
-  'http://icanhazip.com/', 'http://ip-api.com/json/?fields=query', 'http://ifconfig.me/ip']
+  'http://icanhazip.com/', 'http://ip-api.com/json/?fields=query', 'http://ifconfig.me/ip',
+  'http://api.ipapi.is/']
 const ECHO_HTTPS = ['https://api.ipify.org?format=json', 'https://api64.ipify.org?format=json',
   'https://api.ipapi.is/', 'https://ipapi.co/ip/', 'https://ifconfig.me/all.json',
   'https://icanhazip.com/', 'https://checkip.amazonaws.com/']
@@ -53,7 +62,7 @@ const relays = u => ['https://r.jina.ai/' + u,
 // ক্যাশ
 const SL_TTL = 30 * 60 * 1000
 const CT_TTL = 7 * 24 * 3600 * 1000
-const CTX_TTL = 3 * 60 * 1000
+const CTX_TTL = 60 * 1000
 const RES_TTL = 15 * 60 * 1000
 const MEM = new Map()
 function memGet(k, ttl) { const h = MEM.get(k); return h && Date.now() - h.t < ttl ? h.v : undefined }
@@ -62,7 +71,6 @@ const inflight = new Map()
 
 const CT_RE = /"connection_type"\s*:\s*"([^"]+)"/i
 const CT_ANY = /(Cable\/DSL|Cellular|Corporate|Satellite)/i
-const CT_HIT = /connection_type|Connection Type/i
 const LIMIT_RE = /reached[^.]{0,40}limit|too many requests|25 IP addresses/i
 
 // মোবাইল — শুধু আসল মোবাইল সিগন্যাল
@@ -71,7 +79,7 @@ const CELL_RE = /\b(mobile|cellular|wireless|gsm|lte|4g|5g|umts|cdma|gprs)\b|t-?
 const FIXED_RE = /(telecom|telekom|communications|unicom|broadband|fiber|fibre|ftth|cable|dsl|adsl|vdsl|\bisp\b|internet|networks?|comcast|charter|spectrum|\bcox\b|virgin|sky\b|\bbt\b|verizon|at&t|centurylink|frontier|windstream|telus|bell\b|rogers|telstra|optus|\btpg\b|\bsfr\b|bouygues|orange|telefonica|telia|telenor|elisa|\bkpn\b|proximus|swisscom|chinanet|ntt|kddi|j:com)/i
 const DC_RE = /(hosting|datacenter|data ?center|\bvps\b|cloud|server|colo|amazon|aws|google|azure|microsoft|digitalocean|linode|ovh|hetzner|contabo|vultr|oracle|alibaba|tencent|leaseweb|m247|choopa|cogent|scaleway)/i
 
-const FIELDS = ['proxy', 'scheme', 'ip', 'verdict', 'reasons', 'src', 'sl_src', 'i2l_src', 'ct_src',
+const FIELDS = ['proxy', 'scheme', 'ip', 'verdict', 'reasons', 'stage', 'src', 'sl_src', 'i2l_src', 'ct_src',
                 'sl_vpn', 'sl_rproxy', 'sl_dc', 'i2l_anon', 'i2l_fraud', 'i2l_seen', 'api_flags',
                 'mm_ct', 'mm_asn', 'mm_asnorg', 'mm_isp', 'mm_org', 'mm_lat', 'mm_lon', 'mm_net', 'secs']
 const blank = p => Object.fromEntries([...FIELDS.map(f => [f, '']), ['proxy', p]])
@@ -79,6 +87,7 @@ const rnd = (a, b) => a + Math.random() * (b - a)
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 const TE = new TextEncoder()
 const normWorker = w => String(w || '').trim().replace(/\/+$/, '')
+const clampBudget = v => Math.min(Math.max(Number(v) || 8, 4), 25)
 
 // ---------- সকেট র‍্যাপার ----------
 class RawSock {
@@ -443,8 +452,6 @@ function parseI2l(t) {
   return { anon, seen, fraud }
 }
 
-const yn = v => ({ YES: 'YES', TRUE: 'YES', NO: 'NO', FALSE: 'NO', 'N/A': 'N/A' }[String(v || '').trim().toUpperCase()] || '')
-
 function seenDays(v) {
   const m = String(v || '').match(new RegExp(String.raw`(\d+)\s*(second|minute|hour|day|week|month|year)s?\s*ago`, 'i'))
   if (!m) return null
@@ -454,12 +461,23 @@ function seenDays(v) {
 
 const fraudNum = v => /^\d+$/.test(String(v || '').trim()) ? Number(v) : null
 
-function slVerdict(p) {
-  if (!p || !(p.vpn || p.dc)) return ['UNKNOWN', 'no data']
-  const bad = ['vpn', 'dc'].filter(k => p[k] === 'YES')
+// dc পড়া না গেলে ASN/org + MaxMind টাইপ থেকে ইনফার করা হয়
+function slVerdict(p, ct) {
+  if (!p || !(p.vpn || p.dc || p.rproxy)) return ['UNKNOWN', 'no data']
+  const vpn = p.vpn
+  let dc = p.dc
+  let inferred = false
+  if (dc !== 'YES' && dc !== 'NO') {
+    const org = ct && (ct.asnorg || ct.org || ct.isp)
+    if (ct && ct.ct === 'Data Center') { dc = 'YES'; inferred = true }
+    else if (vpn === 'NO' && org) { dc = DC_RE.test(org) ? 'YES' : 'NO'; inferred = true }
+  }
+  const bad = []
+  if (vpn === 'YES') bad.push('vpn')
+  if (dc === 'YES') bad.push('dc')
   if (bad.length) return ['FAIL', 'flagged: ' + bad.join(',')]
-  if (p.vpn !== 'NO' || p.dc !== 'NO') return ['UNKNOWN', 'vpn/dc unreadable']
-  return ['PASS', `vpn=No dc=No rproxy=${p.rproxy || '-'}`]
+  if (vpn !== 'NO' || dc !== 'NO') return ['UNKNOWN', 'vpn/dc unreadable']
+  return ['PASS', `vpn=No dc=No${inferred ? '(inf)' : ''} rproxy=${p.rproxy || '-'}`]
 }
 
 function i2lVerdict(p) {
@@ -634,19 +652,28 @@ function cdnWrite(ip, v) {
 
 let MM_LIMIT_AT = 0
 
-async function fetchMm(url, ip) {
-  const jobs = []
-  for (const f of MM_RELAYS) jobs.push(requestText(f(url), { timeout: 9000, minLen: 400, needIp: ip }))
-  jobs.push(requestText(url, { timeout: 7000, minLen: 800, needIp: ip, headers: MM_HDR() }))
-
-  const texts = await Promise.all(jobs)
+// দুই রাউন্ড — প্রথমে সব প্যারালাল, না পেলে সংক্ষিপ্ত দ্বিতীয় রাউন্ড
+async function fetchMm(url, ip, alt) {
   let best = null
-  for (const t of texts) {
-    if (!t) continue
-    if (LIMIT_RE.test(t)) MM_LIMIT_AT = Date.now()
-    const v = parseMm(t, ip)
-    if (v && v.ct) return t
-    if (!best && v) best = t
+  for (let round = 0; round < 2; round++) {
+    const jobs = []
+    const list = round === 0 ? MM_RELAYS : MM_RELAYS.slice(0, 2)
+    const to = round === 0 ? 9000 : 5500
+    for (const f of list) jobs.push(requestText(f(url), { timeout: to, minLen: 400, needIp: ip }))
+    if (round === 0) {
+      jobs.push(requestText(url, { timeout: 7000, minLen: 800, needIp: ip, headers: MM_HDR() }))
+      if (alt) jobs.push(requestText(alt, { timeout: 7000, minLen: 800, needIp: ip, headers: MM_HDR() }))
+    }
+    const texts = await Promise.all(jobs)
+    for (const t of texts) {
+      if (!t) continue
+      if (LIMIT_RE.test(t)) MM_LIMIT_AT = Date.now()
+      const v = parseMm(t, ip)
+      if (v && v.ct) return t
+      if (!best && v) best = t
+    }
+    if (best) return best
+    if (round === 0) await sleep(250)
   }
   return best
 }
@@ -668,7 +695,7 @@ async function flushBatch() {
   BATCH = []
   if (!jobs.length) return
   const ips = jobs.map(j => j.ip)
-  const text = await fetchMm(MM_BULK(ips), ips[0])
+  const text = await fetchMm(MM_BULK(ips), ips[0], MM_ONE(ips[0]))
   if (!text) {
     for (const j of jobs) { memSet('mmx:' + j.ip, 1); j.res(null) }
     return
@@ -680,10 +707,12 @@ async function flushBatch() {
   }
 }
 
-async function mmInfo(ip) {
-  const hit = memGet('mm:' + ip, CT_TTL)
-  if (hit) return hit
-  if (memGet('mmx:' + ip, CTX_TTL)) return null
+async function mmInfo(ip, fresh) {
+  if (!fresh) {
+    const hit = memGet('mm:' + ip, CT_TTL)
+    if (hit) return hit
+    if (memGet('mmx:' + ip, CTX_TTL)) return null
+  }
   if (inflight.has('mm:' + ip)) return inflight.get('mm:' + ip)
   const pr = (async () => {
     const c = await cdnRead(ip)
@@ -722,23 +751,48 @@ function flushApi() {
   return APICHAIN
 }
 
-async function apiDo(jobs) {
+async function apiGap() {
   const gap = API_GAP - (Date.now() - APILAST)
   if (gap > 0) await sleep(gap)
   APILAST = Date.now()
+}
+
+async function apiDo(jobs) {
   const ips = jobs.map(j => j.ip)
   let arr = null
   for (let k = 0; k < 3 && !arr; k++) {
+    await apiGap()
     const r = await apiPost(ips)
-    if (r === '429') { await sleep(5000 * (k + 1)); continue }
+    if (r === '429') { await sleep(4000 * (k + 1)); continue }
     arr = r
   }
   const map = new Map()
   if (Array.isArray(arr)) for (const o of arr) if (o && o.query) map.set(o.query, o)
+
+  let singles = 0
   for (const j of jobs) {
     const o = map.get(j.ip)
-    if (o && o.status === 'success') { memSet('ia:' + j.ip, o); j.res(o) } else j.res(null)
+    if (o && o.status === 'success') { memSet('ia:' + j.ip, o); j.res(o); continue }
+    // ব্যাচে যেগুলো মিস — একক ফলব্যাক
+    if (singles < API_SINGLE_MAX) {
+      singles++
+      const s = await apiSingle(j.ip)
+      if (s) { memSet('ia:' + j.ip, s); j.res(s); continue }
+    }
+    j.res(null)
   }
+}
+
+async function apiSingle(ip) {
+  await apiGap()
+  const ctl = new AbortController()
+  const t = setTimeout(() => ctl.abort(), 7000)
+  try {
+    const r = await fetch(API_ONE(ip), { signal: ctl.signal })
+    if (!r.ok) return null
+    const j = await r.json()
+    return j && j.status === 'success' ? j : null
+  } catch { return null } finally { clearTimeout(t) }
 }
 
 async function apiPost(ips) {
@@ -758,9 +812,11 @@ async function apiPost(ips) {
   } catch { return null } finally { clearTimeout(t) }
 }
 
-async function apiInfo(ip) {
-  const c = memGet('ia:' + ip, CT_TTL)
-  if (c !== undefined) return c
+async function apiInfo(ip, fresh) {
+  if (!fresh) {
+    const c = memGet('ia:' + ip, CT_TTL)
+    if (c !== undefined) return c
+  }
   if (inflight.has('ia:' + ip)) return inflight.get('ia:' + ip)
   const pr = apiEnqueue(ip)
   inflight.set('ia:' + ip, pr)
@@ -786,8 +842,28 @@ async function ipapiIs(ip, key) {
   return v
 }
 
+// ---------- ASN/org ফলব্যাক ----------
+async function geoFallback(ip) {
+  for (const f of GEO_FB) {
+    const t = await requestText(f(ip), { timeout: 5000, headers: JSON_HDR })
+    if (!t) continue
+    let j = null
+    try { j = JSON.parse(t) } catch { continue }
+    if (!j || j.success === false || j.bSuccess === false) continue
+    const rawAsn = String(j.connection?.asn || j.asn || j.asnNumber || '').replace(/^AS/i, '')
+    const org = String(j.connection?.org || j.connection?.isp || j.asnOrganization || j.isp || j.org || '')
+    if (!rawAsn && !org) continue
+    return {
+      asn: /^\d+$/.test(rawAsn) ? 'AS' + rawAsn : '',
+      asnorg: org,
+      isp: String(j.connection?.isp || j.isp || ''),
+      org
+    }
+  }
+  return null
+}
+
 // ---------- টাইপ নির্ণয় ----------
-// ক্রম: MaxMind → satellite → datacenter → mobile ফ্ল্যাগ → মোবাইল নাম → ফিক্সড-লাইন নাম → ডিফল্ট Cable/DSL
 function deriveCt(org, dcFlag, mobileFlag, satFlag) {
   if (satFlag) return 'Satellite'
   if (dcFlag) return 'Data Center'
@@ -799,16 +875,18 @@ function deriveCt(org, dcFlag, mobileFlag, satFlag) {
   return 'Cable/DSL'
 }
 
-async function connType(ip, key) {
-  const cached = memGet('ct:' + ip, CT_TTL)
-  if (cached) return cached
+async function connType(ip, key, fresh) {
+  if (!fresh) {
+    const cached = memGet('ct:' + ip, CT_TTL)
+    if (cached) return cached
+  }
   if (inflight.has('ct:' + ip)) return inflight.get('ct:' + ip)
 
   const pr = (async () => {
     const r = { ct: '', src: '', api: null, asn: '', asnorg: '', isp: '', org: '', lat: '', lon: '', net: '' }
     const [mm, o, a] = await Promise.all([
-      mmInfo(ip),
-      apiInfo(ip),
+      mmInfo(ip, fresh),
+      apiInfo(ip, fresh),
       key ? ipapiIs(ip, key) : Promise.resolve(null)
     ])
 
@@ -831,10 +909,18 @@ async function connType(ip, key) {
     }
     if (a) r.api = { ...(r.api || {}), ...a }
 
+    if (!r.asn && !r.asnorg && !r.isp) {
+      const g = await geoFallback(ip)
+      if (g) {
+        r.asn = g.asn; r.asnorg = g.asnorg
+        r.isp = g.isp; r.org = r.org || g.org
+      }
+    }
+
     if (!r.ct) {
       const org = r.asnorg || r.org || r.isp
       const d = deriveCt(org, r.api && r.api.is_datacenter, r.api && r.api.is_mobile, false)
-      if (d) { r.ct = d; r.src = 'derived' }
+      if (d) { r.ct = d; r.src = r.api && r.api.is_mobile ? 'derived(mobile)' : 'derived' }
     }
 
     memSet('ct:' + ip, r)
@@ -874,35 +960,36 @@ async function tryEcho(p, urls, timeout) {
   return ''
 }
 
-function firstOk(tasks) {
-  return new Promise(res => {
-    let n = tasks.length, done = false
-    const settle = v => { n--; if (v && !done) { done = true; res(v) } else if (n === 0 && !done) { done = true; res(null) } }
-    for (const t of tasks) t.then(settle, () => settle(null))
-  })
-}
-
 async function exitIp(p, budget) {
-  const per = Math.min(12000, Math.max(ECHO_MIN, Math.round(budget * 500)))
+  const per = Math.min(7000, Math.max(3200, Math.round(budget * 380)))
+  const total = Math.min(Math.max(budget * 1000, 6500), 14000)
   const socksFirst = p.scheme === 'socks5' || p.scheme === 'socks4'
   const A = socksFirst ? 'socks5' : 'http'
   const B = socksFirst ? 'http' : 'socks5'
-
   const plain = [...ECHO_HTTP].sort(() => Math.random() - 0.5)
-  const p1 = await firstOk([
-    tryEcho({ ...p, scheme: A }, plain.slice(0, 2), per).then(ip => ip && { ip, scheme: A }),
-    tryEcho({ ...p, scheme: B }, plain.slice(2, 3), per).then(ip => ip && { ip, scheme: B })
-  ])
-  if (p1) return p1
+  const tls = [...ECHO_HTTPS].sort(() => Math.random() - 0.5)
 
-  const tlsUrls = [...ECHO_HTTPS].sort(() => Math.random() - 0.5)
-  const got = await firstOk([
-    tryEcho({ ...p, scheme: A }, tlsUrls.slice(0, 1), per).then(ip => ip && { ip, scheme: A }),
-    tryEcho({ ...p, scheme: B }, tlsUrls.slice(1, 2), per).then(ip => ip && { ip, scheme: B })
-  ])
-  if (got) return got
-  const rest = await tryEcho({ ...p, scheme: A }, tlsUrls.slice(2, 4), per)
-  return rest ? { ip: rest, scheme: A } : null
+  const lanes = [
+    { scheme: A, urls: plain.slice(0, 2) },
+    { scheme: A, urls: tls.slice(0, 2) },
+    { scheme: B, urls: plain.slice(2, 4) },
+    { scheme: B, urls: tls.slice(2, 4) }
+  ]
+
+  return new Promise(res => {
+    let done = false
+    const timers = []
+    const stop = () => { for (const t of timers) clearTimeout(t) }
+    lanes.forEach((ln, i) => {
+      timers.push(setTimeout(() => {
+        if (done) return
+        tryEcho({ ...p, scheme: ln.scheme }, ln.urls, per).then(ip => {
+          if (ip && !done) { done = true; stop(); res({ ip, scheme: ln.scheme }) }
+        }).catch(() => {})
+      }, i * 200))
+    })
+    timers.push(setTimeout(() => { if (!done) { done = true; stop(); res(null) } }, total))
+  })
 }
 
 async function viaWorker(worker, target, ip) {
@@ -926,25 +1013,32 @@ async function viaRelay(url, ip) {
   return out.find(Boolean) || null
 }
 
-async function getSl(ip, worker) {
-  const c = memGet('sl:' + ip, SL_TTL)
-  if (c) return c
-  let t = null, src = 'none'
-  if (worker) { t = await viaWorker(worker, SL_PAGE(ip), ip); if (t) src = 'worker' }
-  if (!t) { t = await page(SL_PAGE(ip), ip); if (t) src = 'direct' }
-  if (!t) { t = await viaRelay(SL_PAGE(ip), ip); if (t) src = 'relay' }
+async function scrape(url, ip, worker, fresh) {
+  if (worker) { const t = await viaWorker(worker, url, ip); if (t) return [t, 'worker'] }
+  const t = await page(url, ip)
+  if (t) return [t, 'direct']
+  if (fresh) return [null, 'none']
+  const r = await viaRelay(url, ip)
+  return [r, r ? 'relay' : 'none']
+}
+
+async function getSl(ip, worker, fresh) {
+  if (!fresh) {
+    const c = memGet('sl:' + ip, SL_TTL)
+    if (c) return c
+  }
+  const [t, src] = await scrape(SL_PAGE(ip), ip, worker, fresh)
   const out = [t ? parseSl(t) : null, t ? src : 'none']
   if (out[0]) memSet('sl:' + ip, out)
   return out
 }
 
-async function getI2l(ip, worker) {
-  const c = memGet('i2l:' + ip, SL_TTL)
-  if (c) return c
-  let t = null, src = 'none'
-  if (worker) { t = await viaWorker(worker, I2L_PAGE(ip), ip); if (t) src = 'worker' }
-  if (!t) { t = await page(I2L_PAGE(ip), ip); if (t) src = 'direct' }
-  if (!t) { t = await viaRelay(I2L_PAGE(ip), ip); if (t) src = 'relay' }
+async function getI2l(ip, worker, fresh) {
+  if (!fresh) {
+    const c = memGet('i2l:' + ip, SL_TTL)
+    if (c) return c
+  }
+  const [t, src] = await scrape(I2L_PAGE(ip), ip, worker, fresh)
   const out = [t ? parseI2l(t) : null, t ? src : 'none']
   if (out[0]) memSet('i2l:' + ip, out)
   return out
@@ -960,76 +1054,127 @@ async function run(request) {
   const t0 = Date.now()
 
   let body = {}
-  try { body = (await request.json()) || {} } catch { return json({ ...blank(''), verdict: 'ERROR', reasons: 'bad body' }) }
+  try { body = (await request.json()) || {} } catch { return json({ ...blank(''), verdict: 'ERROR', reasons: 'bad body', stage: 'parse', secs: 0 }) }
 
   const rec = blank(String(body.proxy || ''))
   const worker = normWorker(body.worker)
   const key = String(body.key || '').trim()
-  const budget = Math.min(Math.max(Number(body.timeout) || 8, 4), 20)
+  const budget = clampBudget(body.timeout)
   const p = parseProxy(rec.proxy)
-  if (!p) return json({ ...rec, verdict: 'ERROR', reasons: 'invalid proxy' })
+  if (!p) return json({ ...rec, verdict: 'ERROR', reasons: 'invalid proxy', stage: 'parse', secs: 0 })
 
-  try {
-    const got = await exitIp(p, budget)
-    if (!got) return json({ ...rec, verdict: 'DEAD', reasons: 'no exit IP (http+socks5 failed)',
-                            secs: +((Date.now() - t0) / 1000).toFixed(1) })
-    rec.ip = got.ip
-    rec.scheme = got.scheme
+  const secs = () => +((Date.now() - t0) / 1000).toFixed(1)
+  const DEADLINE = 16000 + budget * 1000
 
-    const hit = memGet('res:' + rec.ip, RES_TTL)
-    if (hit) return json({ ...hit, proxy: rec.proxy, secs: +((Date.now() - t0) / 1000).toFixed(1) })
-
-    const wait = budget * 1000
-    const [slR, i2lR, ct] = await Promise.all([
-      timed(getSl(rec.ip, worker), wait),
-      timed(getI2l(rec.ip, worker), wait),
-      timed(connType(rec.ip, key), Math.max(wait, 25000))
-    ])
-
-    const [sl, ssrc] = slR || [null, 'none']
-    const [i2l, isrc] = i2lR || [null, 'none']
-    rec.sl_src = ssrc
-    rec.i2l_src = isrc
-    rec.src = `${ssrc}/${isrc}`
-
-    const [vs, rs] = slVerdict(sl)
-    const [vi, ri] = i2lVerdict(i2l)
-    let verdict = 'UNKNOWN'
-    let extra = ''
-    if (vs === 'FAIL' || vi === 'FAIL') verdict = 'FAIL'
-    else if (vs === 'PASS' && vi === 'PASS') verdict = 'PASS'
-    else {
-      const av = apiVerdict(ct && ct.api)
-      if (av) { verdict = av[0]; extra = ' | ' + av[1] }
+  let out = null
+  const finish = () => {
+    if (!out) {
+      if (!rec.verdict) rec.verdict = rec.ip ? 'UNKNOWN' : (rec.stage === 'exit' ? 'ERROR' : 'DEAD')
+      if (!rec.reasons) rec.reasons = rec.ip ? 'timeout — partial result' : (rec.stage === 'exit' ? 'timeout during exit' : 'no exit IP')
+      rec.secs = secs()
+      out = json(rec)
     }
-
-    rec.mm_ct = (ct && ct.ct) || ''
-    rec.ct_src = (ct && ct.src) || ''
-    rec.mm_asn = (ct && ct.asn) || ''
-    rec.mm_asnorg = (ct && ct.asnorg) || ''
-    rec.mm_isp = (ct && ct.isp) || ''
-    rec.mm_org = (ct && ct.org) || ''
-    rec.mm_lat = (ct && ct.lat) || ''
-    rec.mm_lon = (ct && ct.lon) || ''
-    rec.mm_net = (ct && ct.net) || ''
-    const a = ct && ct.api
-    rec.api_flags = a ? `vpn:${+!!a.is_vpn} dc:${+!!a.is_datacenter} proxy:${+!!a.is_proxy} tor:${+!!a.is_tor} mobile:${+!!a.is_mobile} abuser:${+!!a.is_abuser}` : ''
-    rec.sl_vpn = (sl && sl.vpn) || ''
-    rec.sl_rproxy = (sl && sl.rproxy) || ''
-    rec.sl_dc = (sl && sl.dc) || ''
-    rec.i2l_anon = (i2l && i2l.anon) || ''
-    rec.i2l_fraud = (i2l && i2l.fraud) || ''
-    rec.i2l_seen = (i2l && i2l.seen) || ''
-
-    rec.verdict = verdict
-    rec.reasons = `scam: ${rs} | ip2loc: ${ri}${extra}`
-    rec.secs = +((Date.now() - t0) / 1000).toFixed(1)
-
-    if (verdict !== 'UNKNOWN') memSet('res:' + rec.ip, rec)
-    return json(rec)
-  } catch (e) {
-    return json({ ...rec, verdict: 'ERROR', reasons: `${e.name}: ${String(e.message).slice(0, 100)}` })
+    return out
   }
+
+  const work = (async () => {
+    try {
+      rec.stage = 'exit'
+      const got = await exitIp(p, budget)
+      if (!got) { rec.verdict = 'DEAD'; rec.reasons = 'no exit IP (http+socks5 failed)'; return finish() }
+      rec.ip = got.ip
+      rec.scheme = got.scheme
+
+      const hit = memGet('res:' + rec.ip, RES_TTL)
+      if (hit) { Object.assign(rec, { ...hit, proxy: rec.proxy }); return finish() }
+
+      const left = () => Math.max(DEADLINE - (Date.now() - t0), 4500)
+      rec.stage = 'pages'
+      const [slR, i2lR, ctR] = await Promise.all([
+        timed(getSl(rec.ip, worker), left()),
+        timed(getI2l(rec.ip, worker), left()),
+        timed(connType(rec.ip, key), Math.max(left(), 12000))
+      ])
+
+      let sl = slR ? slR[0] : null
+      let ssrc = slR ? slR[1] : 'none'
+      let i2l = i2lR ? i2lR[0] : null
+      let isrc = i2lR ? i2lR[1] : 'none'
+      let ct = ctR || null
+
+      // দ্বিতীয় পাস — যা মিস হয়েছে তা ফ্রেশ আবার
+      rec.stage = 'retry'
+      const need = []
+      if (!sl) need.push('sl')
+      else if (sl.vpn === 'NO' && sl.dc !== 'YES' && sl.dc !== 'NO') need.push('sl2')
+      if (!i2l) need.push('i2l')
+      if (!ct || (!ct.ct && !ct.asn && !ct.asnorg)) need.push('ct')
+
+      for (const k of need) {
+        if (left() < 4500) break
+        if (k === 'sl') {
+          const t = await timed(getSl(rec.ip, worker, true), Math.min(left(), 7000))
+          if (t && t[0]) { sl = t[0]; ssrc = t[1] }
+        } else if (k === 'sl2') {
+          const t = await timed(getSl(rec.ip, worker, true), Math.min(left(), 6000))
+          if (t && t[0] && t[0].dc) { sl = t[0]; ssrc = t[1] }
+        } else if (k === 'i2l') {
+          const t = await timed(getI2l(rec.ip, worker, true), Math.min(left(), 7000))
+          if (t && t[0]) { i2l = t[0]; isrc = t[1] }
+        } else {
+          const t = await timed(connType(rec.ip, key, true), Math.min(left(), 13000))
+          if (t && (t.ct || t.asn || t.asnorg || t.isp)) ct = t
+        }
+      }
+
+      rec.sl_src = ssrc
+      rec.i2l_src = isrc
+      rec.src = `${ssrc}/${isrc}`
+
+      const [vs, rs] = slVerdict(sl, ct)
+      const [vi, ri] = i2lVerdict(i2l)
+      let verdict = 'UNKNOWN'
+      let extra = ''
+      if (vs === 'FAIL' || vi === 'FAIL') verdict = 'FAIL'
+      else if (vs === 'PASS' && vi === 'PASS') verdict = 'PASS'
+      else {
+        const av = apiVerdict(ct && ct.api)
+        if (av) { verdict = av[0]; extra = ' | ' + av[1] }
+      }
+
+      rec.mm_ct = (ct && ct.ct) || ''
+      rec.ct_src = (ct && ct.src) || ''
+      rec.mm_asn = (ct && ct.asn) || ''
+      rec.mm_asnorg = (ct && ct.asnorg) || ''
+      rec.mm_isp = (ct && ct.isp) || ''
+      rec.mm_org = (ct && ct.org) || ''
+      rec.mm_lat = (ct && ct.lat) || ''
+      rec.mm_lon = (ct && ct.lon) || ''
+      rec.mm_net = (ct && ct.net) || ''
+      const a = ct && ct.api
+      rec.api_flags = a ? `vpn:${+!!a.is_vpn} dc:${+!!a.is_datacenter} proxy:${+!!a.is_proxy} tor:${+!!a.is_tor} mobile:${+!!a.is_mobile} abuser:${+!!a.is_abuser}` : ''
+      rec.sl_vpn = (sl && sl.vpn) || ''
+      rec.sl_rproxy = (sl && sl.rproxy) || ''
+      rec.sl_dc = (sl && sl.dc) || ''
+      rec.i2l_anon = (i2l && i2l.anon) || ''
+      rec.i2l_fraud = (i2l && i2l.fraud) || ''
+      rec.i2l_seen = (i2l && i2l.seen) || ''
+
+      rec.verdict = verdict
+      rec.reasons = `scam: ${rs} | ip2loc: ${ri}${extra}`
+      rec.stage = 'done'
+
+      if (verdict !== 'UNKNOWN') memSet('res:' + rec.ip, rec)
+      return finish()
+    } catch (e) {
+      rec.verdict = 'ERROR'
+      rec.reasons = `${e.name}: ${String(e.message).slice(0, 100)}`
+      return finish()
+    }
+  })()
+
+  const bail = sleep(DEADLINE).then(finish)
+  return (await Promise.race([work, bail])) || finish()
 }
 
 // ---------- ডায়াগনস্টিক ----------
